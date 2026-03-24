@@ -1,0 +1,841 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fairy Tails K9 Centre — Boarding Calendar</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800&display=swap" rel="stylesheet">
+  <style>
+    /* ============================================================
+       Fairy Tails K9 Centre — Boarding Calendar Display
+       Designed for 32" landscape staff display
+       UPDATED: Auto-fit for 70" Bush 70QT24SB (3840×2160) — no-scroll
+       ============================================================ */
+
+    :root {
+      --ft-primary: #00acee;
+      --ft-primary-dark: #007ba8;
+      --ft-gradient: linear-gradient(135deg, #00acee 0%, #007ba8 100%);
+      --ft-amber: #F59E0B;
+      --ft-amber-light: #FEF3C7;
+      --ft-amber-dark: #D97706;
+      --ft-bg: #F0F7FC;
+      --ft-card-bg: #FFFFFF;
+      --ft-text: #1E293B;
+      --ft-text-light: #64748B;
+      --ft-border: #E2E8F0;
+      --ft-success: #10B981;
+      --ft-row-alt: #F8FBFE;
+      --ft-shadow: 0 4px 24px rgba(0, 172, 238, 0.08);
+      --ft-shadow-lg: 0 8px 40px rgba(0, 172, 238, 0.12);
+
+      /* ADDED: Boarding School colour scheme — distinct purple/violet */
+      --ft-school: #8B5CF6;
+      --ft-school-dark: #6D28D9;
+      --ft-school-gradient: linear-gradient(135deg, #8B5CF6 0%, #6D28D9 100%);
+
+      /* ADDED: Dynamic content scale factor — adjusted by JS autoFitContent() */
+      --s: 1;
+    }
+
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    html, body {
+      height: 100%;
+      overflow: hidden; /* MODIFIED: was overflow-x: hidden — now fully locked to prevent any scroll */
+      background: var(--ft-bg);
+      font-family: 'Nunito', sans-serif;
+      color: var(--ft-text);
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* --- Page Container --- */
+    .page {
+      display: flex;
+      flex-direction: column;
+      height: 100vh; /* MODIFIED: was min-height — now fixed to viewport */
+      overflow: hidden; /* ADDED: prevent any content overflow */
+      padding: calc(24px * var(--s)) calc(32px * var(--s)); /* MODIFIED: scaled padding */
+    }
+
+    /* --- Header --- */
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: calc(24px * var(--s)); /* MODIFIED: scaled */
+      flex-shrink: 0;
+    }
+
+    .header-left {
+      display: flex;
+      align-items: center;
+      gap: calc(20px * var(--s)); /* MODIFIED: scaled */
+    }
+
+    .logo {
+      width: calc(72px * var(--s)); /* MODIFIED: scaled */
+      height: calc(72px * var(--s)); /* MODIFIED: scaled */
+      border-radius: 16px;
+      object-fit: cover;
+      box-shadow: var(--ft-shadow);
+    }
+
+    .header-title h1 {
+      font-size: calc(28px * var(--s)); /* MODIFIED: scaled */
+      font-weight: 800;
+      background: var(--ft-gradient);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      line-height: 1.2;
+    }
+
+    .header-title .subtitle {
+      font-size: calc(14px * var(--s)); /* MODIFIED: scaled */
+      font-weight: 600;
+      color: var(--ft-text-light);
+      margin-top: 2px;
+    }
+
+    .header-right {
+      text-align: right;
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 6px;
+    }
+
+    .date-range-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: calc(8px * var(--s)); /* MODIFIED: scaled */
+      background: var(--ft-gradient);
+      color: #fff;
+      padding: calc(8px * var(--s)) calc(18px * var(--s)); /* MODIFIED: scaled */
+      border-radius: 24px;
+      font-size: calc(14px * var(--s)); /* MODIFIED: scaled */
+      font-weight: 700;
+      letter-spacing: 0.3px;
+    }
+
+    .date-range-badge svg {
+      width: calc(16px * var(--s)); /* MODIFIED: scaled */
+      height: calc(16px * var(--s)); /* MODIFIED: scaled */
+      flex-shrink: 0;
+    }
+
+    .update-info {
+      font-size: calc(12px * var(--s)); /* MODIFIED: scaled */
+      color: var(--ft-text-light);
+      font-weight: 600;
+    }
+
+    .status-dot {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--ft-success);
+      margin-right: 4px;
+      animation: pulse 2s ease-in-out infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+
+    /* --- Main Table Card --- */
+    .table-card {
+      flex: 1;
+      background: var(--ft-card-bg);
+      border-radius: 20px;
+      box-shadow: var(--ft-shadow-lg);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* --- Table --- */
+    .boarding-table {
+      width: 100%;
+      border-collapse: collapse;
+      table-layout: fixed;
+    }
+
+    .boarding-table thead th {
+      background: var(--ft-gradient);
+      color: #fff;
+      font-weight: 700;
+      font-size: calc(15px * var(--s)); /* MODIFIED: scaled */
+      padding: calc(16px * var(--s)) calc(24px * var(--s)); /* MODIFIED: scaled */
+      text-align: left;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+
+    .boarding-table thead th:first-child {
+      width: 8%;
+      text-align: center;
+    }
+
+    .boarding-table thead th:nth-child(2) {
+      width: 36%;
+    }
+
+    .boarding-table thead th:nth-child(3),
+    .boarding-table thead th:nth-child(4) {
+      width: 28%;
+    }
+
+    .boarding-table tbody tr {
+      transition: background 0.2s ease;
+    }
+
+    .boarding-table tbody tr:nth-child(even) {
+      background: var(--ft-row-alt);
+    }
+
+    .boarding-table tbody tr:hover {
+      background: rgba(0, 172, 238, 0.06);
+    }
+
+    .boarding-table tbody td {
+      padding: calc(18px * var(--s)) calc(24px * var(--s)); /* MODIFIED: scaled */
+      font-size: calc(18px * var(--s)); /* MODIFIED: scaled */
+      font-weight: 600;
+      border-bottom: 1px solid var(--ft-border);
+      vertical-align: middle;
+    }
+
+    /* Row number column */
+    .row-num {
+      text-align: center;
+      font-size: calc(14px * var(--s)); /* MODIFIED: scaled */
+      font-weight: 700;
+      color: var(--ft-text-light);
+    }
+
+    /* Dog name styling */
+    .dog-name {
+      display: flex;
+      align-items: center;
+      gap: calc(12px * var(--s)); /* MODIFIED: scaled */
+    }
+
+    .dog-icon {
+      width: calc(36px * var(--s)); /* MODIFIED: scaled */
+      height: calc(36px * var(--s)); /* MODIFIED: scaled */
+      border-radius: 10px;
+      background: var(--ft-gradient);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+
+    /* ADDED: Boarding School icon uses purple gradient */
+    .dog-icon.school {
+      background: var(--ft-school-gradient);
+    }
+
+    .dog-icon svg {
+      width: calc(20px * var(--s)); /* MODIFIED: scaled */
+      height: calc(20px * var(--s)); /* MODIFIED: scaled */
+      fill: #fff;
+    }
+
+    .dog-name-text {
+      line-height: 1.3;
+    }
+
+    .dog-name-text .first {
+      color: var(--ft-text);
+    }
+
+    .dog-name-text .surname {
+      color: var(--ft-primary-dark);
+      font-weight: 700;
+    }
+
+    /* ADDED: Boarding School surname uses purple instead of blue */
+    .school-name .surname {
+      color: var(--ft-school-dark);
+    }
+
+    /* ADDED: Type badge — small label shown next to dog name */
+    .type-badge {
+      display: inline-block;
+      font-size: calc(10px * var(--s)); /* MODIFIED: scaled */
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      padding: 2px 8px;
+      border-radius: 6px;
+      line-height: 1.4;
+      vertical-align: middle;
+      margin-left: 4px;
+    }
+
+    .type-badge.boarding {
+      background: rgba(0, 172, 238, 0.12);
+      color: var(--ft-primary-dark);
+    }
+
+    .type-badge.school {
+      background: rgba(139, 92, 246, 0.12);
+      color: var(--ft-school-dark);
+    }
+
+    /* Date cells */
+    .date-cell {
+      display: flex;
+      align-items: center;
+      gap: calc(10px * var(--s)); /* MODIFIED: scaled */
+    }
+
+    .day-name {
+      font-size: calc(13px * var(--s)); /* MODIFIED: scaled */
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      min-width: calc(36px * var(--s)); /* MODIFIED: scaled */
+    }
+
+    .date-text {
+      font-size: calc(18px * var(--s)); /* MODIFIED: scaled */
+      font-weight: 600;
+    }
+
+    /* Weekend styling — amber colour for dates that fall on Sat/Sun */
+    .weekend .day-name {
+      color: var(--ft-amber-dark);
+    }
+
+    .weekend .date-text {
+      color: var(--ft-amber);
+      font-weight: 700;
+    }
+
+    /* Weekday styling */
+    .weekday .day-name {
+      color: var(--ft-primary);
+    }
+
+    .weekday .date-text {
+      color: var(--ft-text);
+    }
+
+    /* --- Footer --- */
+    .footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: calc(16px * var(--s)) 0 0 0; /* MODIFIED: scaled */
+      margin-top: calc(16px * var(--s)); /* MODIFIED: scaled */
+      flex-shrink: 0;
+    }
+
+    .footer-left {
+      font-size: calc(12px * var(--s)); /* MODIFIED: scaled */
+      color: var(--ft-text-light);
+      font-weight: 600;
+    }
+
+    .footer-right {
+      font-size: calc(12px * var(--s)); /* MODIFIED: scaled */
+      color: var(--ft-text-light);
+      font-weight: 600;
+    }
+
+    .countdown {
+      color: var(--ft-primary);
+      font-weight: 700;
+    }
+
+    /* --- Loading State --- */
+    .loading-overlay {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 80px 20px;
+      gap: 20px;
+    }
+
+    .spinner {
+      width: 48px;
+      height: 48px;
+      border: 4px solid var(--ft-border);
+      border-top-color: var(--ft-primary);
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+    .loading-text {
+      font-size: 16px;
+      font-weight: 600;
+      color: var(--ft-text-light);
+    }
+
+    /* --- Error State --- */
+    .error-banner {
+      background: #FEF2F2;
+      border: 1px solid #FECACA;
+      border-radius: 12px;
+      padding: calc(16px * var(--s)) calc(24px * var(--s)); /* MODIFIED: scaled */
+      margin-bottom: calc(16px * var(--s)); /* MODIFIED: scaled */
+      color: #991B1B;
+      font-size: calc(14px * var(--s)); /* MODIFIED: scaled */
+      font-weight: 600;
+      display: none;
+    }
+
+    /* --- Empty State --- */
+    .empty-state {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 80px 20px;
+      gap: 16px;
+    }
+
+    .empty-state svg {
+      width: 64px;
+      height: 64px;
+      fill: var(--ft-text-light);
+      opacity: 0.4;
+    }
+
+    .empty-state p {
+      font-size: 18px;
+      font-weight: 600;
+      color: var(--ft-text-light);
+    }
+
+    /* --- Fade-in animation for rows --- */
+    .fade-in {
+      animation: fadeIn 0.4s ease forwards;
+      opacity: 0;
+    }
+
+    @keyframes fadeIn {
+      to { opacity: 1; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+
+    <!-- Header -->
+    <div class="header">
+      <div class="header-left">
+        <img src="https://i.ibb.co/whdBKp0L/Logo-1.jpg" alt="Fairy Tails K9 Centre" class="logo">
+        <div class="header-title">
+          <h1>Boarding Calendar</h1>
+          <div class="subtitle">Staff Display — 7-Day Overview</div>
+        </div>
+      </div>
+      <div class="header-right">
+        <div class="date-range-badge" id="dateRangeBadge">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+          <span id="dateRangeText">Loading...</span>
+        </div>
+        <div class="update-info">
+          <span class="status-dot"></span>
+          Last updated: <span id="lastUpdated">—</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Error Banner (hidden by default) -->
+    <div class="error-banner" id="errorBanner"></div>
+
+    <!-- Main Table Card -->
+    <div class="table-card">
+      <!-- Loading state (shown initially) -->
+      <div class="loading-overlay" id="loadingState">
+        <div class="spinner"></div>
+        <div class="loading-text">Fetching boarding data from Acuity...</div>
+      </div>
+
+      <!-- Data table (hidden initially) -->
+      <table class="boarding-table" id="boardingTable" style="display:none;">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Dog</th>
+            <th>Check-in</th>
+            <th>Check-out</th>
+          </tr>
+        </thead>
+        <tbody id="tableBody">
+        </tbody>
+      </table>
+
+      <!-- Empty state (hidden initially) -->
+      <div class="empty-state" id="emptyState" style="display:none;">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"/></svg>
+        <p>No boarding stays in the next 7 days</p>
+      </div>
+    </div>
+
+    <!-- Footer -->
+    <div class="footer">
+      <div class="footer-left">
+        Fairy Tails K9 Centre — Boarding Display
+      </div>
+      <div class="footer-right">
+        Next refresh in: <span class="countdown" id="countdown">—</span>
+      </div>
+    </div>
+
+  </div>
+
+  <script>
+    // ============================================================
+    // CONFIGURATION — Paste your deployed Apps Script web app URL below
+    // ============================================================
+    var API_URL = 'https://script.google.com/macros/s/AKfycbz2kc3lJbrGk7lw9jVcZMdUrPWjRx4qBARM8YVAIARhYAlQwCzlhHBbKswyOcVHytmB7Q/exec';
+    var API_TOKEN = 'ft-k9-board-2024-sec';
+
+    // ============================================================
+    // Client-side logic
+    // ============================================================
+
+    var REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000; // 6 hours
+    var nextRefreshTime = null;
+    var countdownTimer = null;
+
+    var DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    var MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                       'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+    /**
+     * Parse a 'YYYY-MM-DD' string into a local Date object.
+     */
+    function parseDate(dateStr) {
+      var parts = dateStr.split('-');
+      return new Date(parseInt(parts[0]), parseInt(parts[1]) - 1, parseInt(parts[2]));
+    }
+
+    /**
+     * Format a date string 'YYYY-MM-DD' into display format with day name.
+     */
+    function formatDisplayDate(dateStr) {
+      var d = parseDate(dateStr);
+      var dayName = DAY_NAMES[d.getDay()];
+      var dayNum = d.getDate();
+      var monthName = MONTH_NAMES[d.getMonth()];
+      return {
+        dayName: dayName,
+        dateText: dayNum + ' ' + monthName,
+        isWeekend: (d.getDay() === 0 || d.getDay() === 6)
+      };
+    }
+
+    /**
+     * Format a date range for the header badge.
+     */
+    function formatDateRange(start, end) {
+      var s = parseDate(start);
+      var e = parseDate(end);
+      return s.getDate() + ' ' + MONTH_NAMES[s.getMonth()] + ' — ' +
+             e.getDate() + ' ' + MONTH_NAMES[e.getMonth()] + ' ' + e.getFullYear();
+    }
+
+    /**
+     * Format an ISO datetime string for "last updated" display.
+     */
+    function formatLastUpdated(isoStr) {
+      var d = new Date(isoStr);
+      var hours = d.getHours();
+      var mins = ('0' + d.getMinutes()).slice(-2);
+      var ampm = hours >= 12 ? 'pm' : 'am';
+      hours = hours % 12 || 12;
+      return hours + ':' + mins + ampm + ', ' +
+             DAY_NAMES[d.getDay()] + ' ' + d.getDate() + ' ' + MONTH_NAMES[d.getMonth()];
+    }
+
+    /**
+     * Paw print icon SVG.
+     */
+    function pawIconSVG() {
+      return '<svg viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg">' +
+        '<ellipse cx="8" cy="6.5" rx="2.2" ry="2.8"/>' +
+        '<ellipse cx="16" cy="6.5" rx="2.2" ry="2.8"/>' +
+        '<ellipse cx="4.5" cy="11.5" rx="2" ry="2.5"/>' +
+        '<ellipse cx="19.5" cy="11.5" rx="2" ry="2.5"/>' +
+        '<path d="M12 22c-3.5 0-6.5-2.5-7-5.5-.3-1.8.5-3.5 2-4.5 1-.7 2.2-1 3.3-1h3.4c1.1 0 2.3.3 3.3 1 1.5 1 2.3 2.7 2 4.5-.5 3-3.5 5.5-7 5.5z"/>' +
+        '</svg>';
+    }
+
+    /**
+     * Build the date cell HTML with weekend highlighting.
+     */
+    function buildDateCell(dateStr) {
+      var info = formatDisplayDate(dateStr);
+      var cls = info.isWeekend ? 'weekend' : 'weekday';
+      return '<div class="date-cell ' + cls + '">' +
+               '<span class="day-name">' + info.dayName + '</span>' +
+               '<span class="date-text">' + info.dateText + '</span>' +
+             '</div>';
+    }
+
+    /**
+     * Escape HTML to prevent XSS.
+     */
+    function escapeHtml(str) {
+      var div = document.createElement('div');
+      div.appendChild(document.createTextNode(str));
+      return div.innerHTML;
+    }
+
+    /**
+     * ADDED: Returns the display label for a stay type.
+     * @param {string} type - 'boarding' or 'school'
+     * @return {string} Human-readable label
+     */
+    function getTypeBadgeLabel(type) {
+      if (type === 'school') return 'School';
+      return 'Holiday';
+    }
+
+    /**
+     * Render the boarding data into the table.
+     * MODIFIED: Now reads stay.type to apply different icon colours
+     * and a type badge for visual distinction.
+     */
+    function renderData(data) {
+      var loadingEl = document.getElementById('loadingState');
+      var tableEl = document.getElementById('boardingTable');
+      var emptyEl = document.getElementById('emptyState');
+      var bodyEl = document.getElementById('tableBody');
+      var errorEl = document.getElementById('errorBanner');
+      var dateRangeEl = document.getElementById('dateRangeText');
+      var lastUpdatedEl = document.getElementById('lastUpdated');
+
+      // Hide loading
+      loadingEl.style.display = 'none';
+
+      // Show error if present
+      if (data.error) {
+        errorEl.textContent = data.error;
+        errorEl.style.display = 'block';
+      } else {
+        errorEl.style.display = 'none';
+      }
+
+      // Update header
+      if (data.dateRange && data.dateRange.start && data.dateRange.end) {
+        dateRangeEl.textContent = formatDateRange(data.dateRange.start, data.dateRange.end);
+      }
+
+      if (data.lastUpdated) {
+        lastUpdatedEl.textContent = formatLastUpdated(data.lastUpdated);
+      }
+
+      // Render table or empty state
+      if (data.stays && data.stays.length > 0) {
+        tableEl.style.display = 'table';
+        emptyEl.style.display = 'none';
+
+        var html = '';
+        for (var i = 0; i < data.stays.length; i++) {
+          var stay = data.stays[i];
+          var delay = (i * 60);
+
+          // Split dog name into first name + surname
+          var nameParts = stay.dogName.split(' ');
+          var firstName = nameParts[0] || '';
+          var surname = nameParts.slice(1).join(' ') || '';
+
+          // ADDED: Determine stay type for styling
+          var stayType = stay.type || 'boarding';
+          var iconClass = 'dog-icon' + (stayType === 'school' ? ' school' : '');
+          var nameClass = 'dog-name-text' + (stayType === 'school' ? ' school-name' : '');
+          var badgeClass = 'type-badge ' + (stayType === 'school' ? 'school' : 'boarding');
+          var badgeLabel = getTypeBadgeLabel(stayType);
+
+          html += '<tr class="fade-in" style="animation-delay:' + delay + 'ms;">' +
+            '<td class="row-num">' + (i + 1) + '</td>' +
+            '<td>' +
+              '<div class="dog-name">' +
+                '<div class="' + iconClass + '">' + pawIconSVG() + '</div>' +
+                '<div class="' + nameClass + '">' +
+                  '<span class="first">' + escapeHtml(firstName) + '</span> ' +
+                  '<span class="surname">' + escapeHtml(surname) + '</span>' +
+                  ' <span class="' + badgeClass + '">' + badgeLabel + '</span>' +
+                '</div>' +
+              '</div>' +
+            '</td>' +
+            '<td>' + buildDateCell(stay.checkIn) + '</td>' +
+            '<td>' + buildDateCell(stay.checkOut) + '</td>' +
+          '</tr>';
+        }
+
+        bodyEl.innerHTML = html;
+
+        // ADDED: Auto-fit content to viewport after rendering rows
+        autoFitContent();
+
+      } else {
+        tableEl.style.display = 'none';
+        emptyEl.style.display = 'flex';
+      }
+    }
+
+    /**
+     * Fetch data from the Apps Script JSON API and render it.
+     * Google Apps Script web apps redirect (302) when accessed cross-origin.
+     * fetch() follows redirects by default, so this works seamlessly.
+     */
+    function loadData() {
+      var bodyEl = document.getElementById('tableBody');
+      if (!bodyEl.innerHTML) {
+        document.getElementById('loadingState').style.display = 'flex';
+      }
+
+      fetch(API_URL + '?token=' + encodeURIComponent(API_TOKEN))
+        .then(function(response) {
+          if (!response.ok) {
+            throw new Error('HTTP ' + response.status);
+          }
+          return response.json();
+        })
+        .then(function(data) {
+          renderData(data);
+          scheduleNextRefresh();
+        })
+        .catch(function(err) {
+          renderData({
+            stays: [],
+            dateRange: { start: '', end: '' },
+            lastUpdated: new Date().toISOString(),
+            error: 'Connection error: ' + (err.message || err)
+          });
+          scheduleNextRefresh();
+        });
+    }
+
+    /**
+     * Schedule the next data refresh and start the countdown timer.
+     */
+    function scheduleNextRefresh() {
+      nextRefreshTime = Date.now() + REFRESH_INTERVAL_MS;
+
+      if (countdownTimer) clearInterval(countdownTimer);
+
+      countdownTimer = setInterval(function() {
+        var remaining = nextRefreshTime - Date.now();
+        if (remaining <= 0) {
+          clearInterval(countdownTimer);
+          loadData();
+          return;
+        }
+
+        var hours = Math.floor(remaining / (1000 * 60 * 60));
+        var mins = Math.floor((remaining % (1000 * 60 * 60)) / (1000 * 60));
+        var secs = Math.floor((remaining % (1000 * 60)) / 1000);
+
+        document.getElementById('countdown').textContent =
+          (hours > 0 ? hours + 'h ' : '') +
+          ('0' + mins).slice(-2) + 'm ' +
+          ('0' + secs).slice(-2) + 's';
+
+      }, 1000);
+    }
+
+    // --- Initial load ---
+    document.addEventListener('DOMContentLoaded', function() {
+      loadData();
+
+      // ADDED: Re-fit content when window is resized (e.g. TV resolution change, dev tools)
+      window.addEventListener('resize', function() {
+        autoFitContent();
+      });
+    });
+
+    /**
+     * ADDED: Auto-fit content to viewport by dynamically adjusting --s (scale factor).
+     *
+     * Measures the page's natural content height at scale=1, then computes a
+     * scale factor so everything fits within window.innerHeight with no scrolling.
+     *
+     * - If many dogs: scale < 1 (font/padding shrink to fit)
+     * - If few dogs: scale > 1 (font/padding grow for readability), capped at 1.6
+     * - Minimum scale: 0.35 (keeps text legible even with many dogs)
+     *
+     * Called after every renderData() and on window resize.
+     */
+    function autoFitContent() {
+      var page = document.querySelector('.page');
+      var root = document.documentElement;
+
+      if (!page) return;
+
+      // Step 1: Reset scale to 1 to measure natural content height
+      root.style.setProperty('--s', '1');
+
+      // Step 2: Temporarily allow overflow so we can measure true content height
+      var origOverflow = page.style.overflow;
+      var origHeight = page.style.height;
+      page.style.overflow = 'visible';
+      page.style.height = 'auto';
+
+      // Force layout reflow
+      void page.offsetHeight;
+
+      var contentHeight = page.scrollHeight;
+      var viewportHeight = window.innerHeight;
+
+      // Step 3: Restore overflow and height constraints
+      page.style.overflow = origOverflow || '';
+      page.style.height = origHeight || '';
+
+      // Step 4: Calculate scale factor
+      if (contentHeight <= 0 || viewportHeight <= 0) return;
+
+      var scale = viewportHeight / contentHeight;
+
+      // Clamp: minimum 0.35 for legibility, maximum 1.6 for readability
+      var MIN_SCALE = 0.35;
+      var MAX_SCALE = 1.6;
+      scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, scale));
+
+      // Step 5: Apply scale factor to CSS custom property
+      root.style.setProperty('--s', scale.toFixed(4));
+
+      // Step 6: Verify fit — if still overflowing after scale, nudge down slightly
+      // (accounts for rounding and sub-pixel differences)
+      void page.offsetHeight;
+      if (page.scrollHeight > viewportHeight + 2) {
+        var correction = viewportHeight / page.scrollHeight;
+        scale = scale * correction;
+        scale = Math.max(MIN_SCALE, scale);
+        root.style.setProperty('--s', scale.toFixed(4));
+      }
+
+      // ADDED: Debug log for development — remove or comment out in production
+      console.log('[autoFit] dogs=' + (document.querySelectorAll('#tableBody tr').length) +
+                  ' contentH=' + contentHeight + ' viewportH=' + viewportHeight +
+                  ' scale=' + scale.toFixed(4));
+    }
+  </script>
+</body>
+</html>
