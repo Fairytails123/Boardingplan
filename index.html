@@ -158,9 +158,10 @@
       background: var(--ft-card-bg);
       border-radius: 20px;
       box-shadow: var(--ft-shadow-lg);
-      overflow: hidden;
+      overflow: visible;
       display: flex;
       flex-direction: column;
+      min-height: 0;
     }
 
     /* --- Table --- */
@@ -428,6 +429,38 @@
       color: var(--ft-text-light);
     }
 
+    /* --- Compact mode: applied by JS when scale < 0.5 (many dogs) --- */
+    .page.compact .header {
+      margin-bottom: calc(12px * var(--s));
+    }
+
+    .page.compact .boarding-table tbody td {
+      padding: calc(10px * var(--s)) calc(16px * var(--s));
+    }
+
+    .page.compact .dog-icon {
+      width: calc(28px * var(--s));
+      height: calc(28px * var(--s));
+      border-radius: 8px;
+    }
+
+    .page.compact .dog-icon svg {
+      width: calc(16px * var(--s));
+      height: calc(16px * var(--s));
+    }
+
+    .page.compact .dog-name {
+      gap: calc(8px * var(--s));
+    }
+
+    .page.compact .boarding-table thead th {
+      padding: calc(10px * var(--s)) calc(16px * var(--s));
+    }
+
+    .page.compact .footer {
+      display: none;
+    }
+
     /* --- Fade-in animation for rows --- */
     .fade-in {
       animation: fadeIn 0.4s ease forwards;
@@ -656,9 +689,10 @@
         emptyEl.style.display = 'none';
 
         var html = '';
+        var skipAnimation = data.stays.length > 15;
         for (var i = 0; i < data.stays.length; i++) {
           var stay = data.stays[i];
-          var delay = (i * 60);
+          var delay = skipAnimation ? 0 : (i * 60);
 
           // Split dog name into first name + surname
           var nameParts = stay.dogName.split(' ');
@@ -672,7 +706,8 @@
           var badgeClass = 'type-badge ' + (stayType === 'school' ? 'school' : 'boarding');
           var badgeLabel = getTypeBadgeLabel(stayType);
 
-          html += '<tr class="fade-in" style="animation-delay:' + delay + 'ms;">' +
+          var rowClass = skipAnimation ? '' : 'fade-in';
+          html += '<tr class="' + rowClass + '" style="animation-delay:' + delay + 'ms;">' +
             '<td class="row-num">' + (i + 1) + '</td>' +
             '<td>' +
               '<div class="dog-name">' +
@@ -772,14 +807,16 @@
     });
 
     /**
-     * ADDED: Auto-fit content to viewport by dynamically adjusting --s (scale factor).
+     * Auto-fit content to viewport by dynamically adjusting --s (scale factor).
      *
-     * Measures the page's natural content height at scale=1, then computes a
-     * scale factor so everything fits within window.innerHeight with no scrolling.
+     * Uses binary search to find the largest scale where content fits the
+     * viewport without scrolling. Handles non-linear scaling (fixed borders,
+     * rounding) correctly by measuring actual rendered height at each candidate.
      *
      * - If many dogs: scale < 1 (font/padding shrink to fit)
      * - If few dogs: scale > 1 (font/padding grow for readability), capped at 1.6
-     * - Minimum scale: 0.35 (keeps text legible even with many dogs)
+     * - Minimum scale: 0.3 (keeps text legible even with many dogs)
+     * - Adds .compact class when scale < 0.5 for extra space savings
      *
      * Called after every renderData() and on window resize.
      */
@@ -789,52 +826,83 @@
 
       if (!page) return;
 
-      // Step 1: Reset scale to 1 to measure natural content height
-      root.style.setProperty('--s', '1');
-
-      // Step 2: Temporarily allow overflow so we can measure true content height
-      var origOverflow = page.style.overflow;
-      var origHeight = page.style.height;
-      page.style.overflow = 'visible';
-      page.style.height = 'auto';
-
-      // Force layout reflow
-      void page.offsetHeight;
-
-      var contentHeight = page.scrollHeight;
       var viewportHeight = window.innerHeight;
+      if (viewportHeight <= 0) return;
 
-      // Step 3: Restore overflow and height constraints
-      page.style.overflow = origOverflow || '';
-      page.style.height = origHeight || '';
-
-      // Step 4: Calculate scale factor
-      if (contentHeight <= 0 || viewportHeight <= 0) return;
-
-      var scale = viewportHeight / contentHeight;
-
-      // Clamp: minimum 0.35 for legibility, maximum 1.6 for readability
-      var MIN_SCALE = 0.35;
+      var MIN_SCALE = 0.3;
       var MAX_SCALE = 1.6;
-      scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, scale));
 
-      // Step 5: Apply scale factor to CSS custom property
-      root.style.setProperty('--s', scale.toFixed(4));
+      // Helper: measure actual page content height at a given scale
+      function measureAt(s, compact) {
+        root.style.setProperty('--s', s.toFixed(4));
+        if (compact) {
+          page.classList.add('compact');
+        } else {
+          page.classList.remove('compact');
+        }
 
-      // Step 6: Verify fit — if still overflowing after scale, nudge down slightly
-      // (accounts for rounding and sub-pixel differences)
-      void page.offsetHeight;
-      if (page.scrollHeight > viewportHeight + 2) {
-        var correction = viewportHeight / page.scrollHeight;
-        scale = scale * correction;
-        scale = Math.max(MIN_SCALE, scale);
-        root.style.setProperty('--s', scale.toFixed(4));
+        // Temporarily allow overflow to measure true height
+        page.style.overflow = 'visible';
+        page.style.height = 'auto';
+        void page.offsetHeight; // force reflow
+        var h = page.scrollHeight;
+        page.style.overflow = '';
+        page.style.height = '';
+        return h;
       }
 
-      // ADDED: Debug log for development — remove or comment out in production
-      console.log('[autoFit] dogs=' + (document.querySelectorAll('#tableBody tr').length) +
-                  ' contentH=' + contentHeight + ' viewportH=' + viewportHeight +
-                  ' scale=' + scale.toFixed(4));
+      // Step 1: Check if content fits at max scale (few dogs)
+      var heightAtMax = measureAt(MAX_SCALE, false);
+      if (heightAtMax <= viewportHeight) {
+        root.style.setProperty('--s', MAX_SCALE.toFixed(4));
+        page.classList.remove('compact');
+        console.log('[autoFit] dogs=' + document.querySelectorAll('#tableBody tr').length +
+                    ' scale=' + MAX_SCALE.toFixed(4) + ' (max)');
+        return;
+      }
+
+      // Step 2: Binary search for the largest scale that fits
+      var lo = MIN_SCALE;
+      var hi = MAX_SCALE;
+      var bestScale = MIN_SCALE;
+
+      for (var i = 0; i < 10; i++) {
+        var mid = (lo + hi) / 2;
+        var isCompact = mid < 0.5;
+        var h = measureAt(mid, isCompact);
+
+        if (h <= viewportHeight) {
+          bestScale = mid;
+          lo = mid;
+        } else {
+          hi = mid;
+        }
+      }
+
+      // Step 3: Apply compact mode if needed
+      var useCompact = bestScale < 0.5;
+      page.classList.toggle('compact', useCompact);
+
+      // Step 4: Apply final scale
+      root.style.setProperty('--s', bestScale.toFixed(4));
+
+      // Step 5: Final verification — nudge down if still overflowing
+      void page.offsetHeight;
+      page.style.overflow = 'visible';
+      page.style.height = 'auto';
+      void page.offsetHeight;
+      if (page.scrollHeight > viewportHeight + 2) {
+        bestScale = bestScale * (viewportHeight / page.scrollHeight);
+        bestScale = Math.max(MIN_SCALE, bestScale);
+        root.style.setProperty('--s', bestScale.toFixed(4));
+      }
+      page.style.overflow = '';
+      page.style.height = '';
+
+      console.log('[autoFit] dogs=' + document.querySelectorAll('#tableBody tr').length +
+                  ' viewportH=' + viewportHeight +
+                  ' scale=' + bestScale.toFixed(4) +
+                  (useCompact ? ' COMPACT' : ''));
     }
   </script>
 </body>
