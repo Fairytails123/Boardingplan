@@ -42,9 +42,13 @@ var BOARDING_SCHOOL_TYPE_NAME = 'boarding school';
 // --- Cache durations ---
 var FEEDING_CACHE_SECONDS = 1800; // 30 minutes for JotForm data
 var BOARDING_TYPE_CACHE_SECONDS = 86400; // 24 hours for appointment type ID
+var BOARDING_DATA_CACHE_SECONDS = 900; // 15 minutes for the full boarding response
 
 // --- Date range for boarding data ---
-var LOOKBACK_DAYS = 30;
+// Display window is today + FORWARD_DAYS. LOOKBACK_DAYS only needs to be long
+// enough to catch ongoing stays that started before today; 10 days covers the
+// vast majority of stays and keeps the appointments-list response small.
+var LOOKBACK_DAYS = 10;
 var FORWARD_DAYS = 6;
 
 // --- API fetch limits ---
@@ -238,6 +242,44 @@ function getBoardingTypeId_() {
   return getAppointmentTypeId_(BOARDING_TYPE_NAME, 'boardingTypeId');
 }
 
+/**
+ * Reads the persisted dog-name cache from PropertiesService.
+ * Stored as a single JSON-encoded { appointmentId: dogName } map.
+ *
+ * Why PropertiesService instead of CacheService: appointment IDs are stable
+ * and dog names for an ID never change, so we want the cache to survive
+ * indefinitely. CacheService entries can be evicted at any time and are
+ * capped at a 6-hour TTL, which forces unnecessary re-fetches of
+ * /appointments/:id (the most expensive Acuity calls in this script).
+ *
+ * @return {Object} Map of { appointmentId: dogName }
+ */
+function getDogNameCache_() {
+  try {
+    var stored = PropertiesService.getScriptProperties().getProperty('dogNameCache');
+    if (!stored) return {};
+    return JSON.parse(stored);
+  } catch (e) {
+    Logger.log('Dog name cache read error: ' + e.message);
+    return {};
+  }
+}
+
+/**
+ * Persists the dog-name cache back to PropertiesService.
+ * @param {Object} cacheObj - Map of { appointmentId: dogName }
+ */
+function saveDogNameCache_(cacheObj) {
+  try {
+    PropertiesService.getScriptProperties().setProperty(
+      'dogNameCache',
+      JSON.stringify(cacheObj)
+    );
+  } catch (e) {
+    Logger.log('Dog name cache write error: ' + e.message);
+  }
+}
+
 /** Finds the appointmentTypeID for "Boarding School". */
 function getBoardingSchoolTypeId_() {
   return getAppointmentTypeId_(BOARDING_SCHOOL_TYPE_NAME, 'boardingSchoolTypeId');
@@ -303,15 +345,12 @@ function fetchAppointmentsForType_(typeId, minDate, maxDate, stayType) {
 
   if (!appointments || !appointments.length) return [];
 
-  // Check the dog name cache — avoids re-fetching details for known appointments
-  var cache = CacheService.getScriptCache();
-  var dogNameCache = {};
-  try {
-    var cached = cache.get('dogNameCache');
-    if (cached) dogNameCache = JSON.parse(cached);
-  } catch (e) {
-    Logger.log('Dog name cache parse error: ' + e.message);
-  }
+  // Check the dog name cache — persisted in PropertiesService so it survives
+  // across executions. Appointment IDs are stable and dog names for an ID
+  // don't change, so most refreshes will hit the cache for every appointment
+  // and skip the expensive per-appointment detail fetches entirely.
+  var dogNameCache = getDogNameCache_();
+  var dogNameCacheChanged = false;
 
   // Only fetch details for appointments we haven't cached
   var authHeader = getAcuityAuthHeader_();
@@ -342,6 +381,7 @@ function fetchAppointmentsForType_(typeId, minDate, maxDate, stayType) {
           var apptId = String(appointments[fetchIndices[r]].id);
           if (extracted) {
             dogNameCache[apptId] = extracted;
+            dogNameCacheChanged = true;
           }
         } catch (parseErr) {
           Logger.log('Failed to parse appointment detail: ' + parseErr.message);
@@ -349,14 +389,9 @@ function fetchAppointmentsForType_(typeId, minDate, maxDate, stayType) {
       }
     }
 
-    // Update the dog name cache (cache for same duration as feeding data)
-    try {
-      var cacheData = JSON.stringify(dogNameCache);
-      if (cacheData.length < CACHE_SIZE_LIMIT) {
-        cache.put('dogNameCache', cacheData, FEEDING_CACHE_SECONDS);
-      }
-    } catch (e) {
-      Logger.log('Dog name cache write error: ' + e.message);
+    // Persist the dog name cache only if we added new entries.
+    if (dogNameCacheChanged) {
+      saveDogNameCache_(dogNameCache);
     }
   }
 
@@ -383,14 +418,65 @@ function fetchAppointmentsForType_(typeId, minDate, maxDate, stayType) {
 // ============================================================
 
 /**
+ * Public entry point. Returns the boarding data, served from a 15-minute
+ * script-level cache when available. The cache key includes today's date
+ * so the cached payload auto-invalidates at midnight.
+ *
+ * Why this matters: every TV / browser / mobile whiteboard that hits
+ * doGet used to trigger a fresh round-trip to Acuity (1 list call + 1
+ * detail call per appointment). With this cache, only one client per
+ * 15-minute window actually contacts Acuity — the rest are served from
+ * cache for free, dramatically reducing quota usage.
+ *
+ * Errors are NOT cached so transient failures retry immediately.
+ *
+ * @return {Object} { stays: [...], dateRange, lastUpdated, error }
+ */
+function getBoardingData() {
+  var cache = CacheService.getScriptCache();
+  var today = new Date();
+  today.setHours(0, 0, 0, 0);
+  var cacheKey = 'boardingData_' + formatDate_(today);
+
+  var cached = cache.get(cacheKey);
+  if (cached) {
+    try {
+      return JSON.parse(cached);
+    } catch (e) {
+      Logger.log('Boarding data cache parse error: ' + e.message);
+    }
+  }
+
+  var data = computeBoardingData_();
+
+  // Only cache successful responses — we want errors to retry on next call.
+  if (data && !data.error) {
+    try {
+      var cacheData = JSON.stringify(data);
+      if (cacheData.length < CACHE_SIZE_LIMIT) {
+        cache.put(cacheKey, cacheData, BOARDING_DATA_CACHE_SECONDS);
+      } else {
+        Logger.log('Boarding data too large for cache (' + cacheData.length + ' bytes), skipping cache');
+      }
+    } catch (e) {
+      Logger.log('Boarding data cache write error: ' + e.message);
+    }
+  }
+
+  return data;
+}
+
+/**
  * Fetches boarding appointments from Acuity for today + 6 days,
  * groups them into stays, and returns structured data.
  *
+ * Internal — called by getBoardingData() which adds the cache layer.
+ *
  * @return {Object} { stays: [...], dateRange: { start, end }, lastUpdated, error }
  */
-function getBoardingData() {
+function computeBoardingData_() {
   try {
-    // 1. Date range: 30 days back to today + 6 days forward
+    // 1. Date range: LOOKBACK_DAYS back to today + FORWARD_DAYS forward
     var today = new Date();
     today.setHours(0, 0, 0, 0);
 
