@@ -104,6 +104,13 @@ function doGet(e) {
 
   if (mode === 'feeding') {
     data = getFeedingBoardData();
+  } else if (mode === 'checkinout') {
+    // --- ADDED: Check-in / Check-out snapshot mode ---
+    // Returns the pre-computed four-bucket snapshot from PropertiesService.
+    // Acuity is only ever hit by the two scheduled triggers (07:00 and 19:00
+    // Europe/London) installed via installRefreshTriggers(), or as a one-off
+    // self-healing fallback when no snapshot exists yet.
+    data = getCheckInOutData();
   } else {
     data = getBoardingData();
   }
@@ -1203,5 +1210,258 @@ function testFeedingBoard() {
       Logger.log('  Notes: ' + dog.feeding.specialNotes);
       Logger.log('  Medication: ' + dog.feeding.medication + ' — ' + dog.feeding.medicationDetails);
     }
+  }
+}
+
+
+// ============================================================
+// ADDED: CHECK-IN / CHECK-OUT SNAPSHOT
+// ------------------------------------------------------------
+// The TV display board ("Check-in / Out" tab) calls
+//   ?mode=checkinout&token=...
+// which returns a pre-computed snapshot of four dog lists:
+//   - checkInToday      (stay.checkIn === today)
+//   - checkOutToday     (stay.checkOut === today)
+//   - checkInTomorrow   (stay.checkIn === tomorrow)
+//   - checkOutTomorrow  (stay.checkOut === tomorrow)
+//
+// Acuity is only hit by the two scheduled triggers
+// (07:00 and 19:00 Europe/London) installed via
+// installRefreshTriggers(). Every other request reads the
+// last snapshot from PropertiesService — zero Acuity calls.
+// A one-off self-healing fetch runs only if no snapshot
+// exists yet (e.g. first deploy before any trigger has run).
+// ============================================================
+
+// PropertiesService keys for the snapshot
+var CHECKINOUT_SNAPSHOT_KEY = 'checkinoutSnapshot';
+var CHECKINOUT_SNAPSHOT_AT_KEY = 'checkinoutSnapshotAt';
+
+// Refresh trigger handler name — referenced by installRefreshTriggers()
+var CHECKINOUT_TRIGGER_HANDLER = 'refreshCheckInOutSnapshot';
+
+// Refresh hours (Europe/London — the project's configured timezone).
+// Two daily triggers: one morning, one evening.
+var CHECKINOUT_MORNING_HOUR = 7;
+var CHECKINOUT_EVENING_HOUR = 19;
+
+/**
+ * Returns 'YYYY-MM-DD' for a given Date in the project's timezone.
+ * The project is configured as Europe/London (appsscript.json), so this
+ * stays aligned with the TV browser's local time at the kennel.
+ */
+function formatDateLondon_(date) {
+  return Utilities.formatDate(date, 'Europe/London', 'yyyy-MM-dd');
+}
+
+/**
+ * Builds the four check-in/check-out lists from a getBoardingData() result.
+ * Pure function — given the same stays and reference date, always returns
+ * the same buckets. No Acuity calls.
+ *
+ * @param {Object} boardingData - The result of getBoardingData()
+ * @param {Date}   [referenceDate] - Optional override for "today"; defaults to now
+ * @return {Object} { checkInToday, checkOutToday, checkInTomorrow, checkOutTomorrow,
+ *                    dateRange, lastUpdated, error }
+ */
+function buildCheckInOutBuckets_(boardingData, referenceDate) {
+  var now = referenceDate || new Date();
+  var todayStr = formatDateLondon_(now);
+
+  var tomorrow = new Date(now.getTime());
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  var tomorrowStr = formatDateLondon_(tomorrow);
+
+  var stays = (boardingData && boardingData.stays) ? boardingData.stays : [];
+
+  var checkInToday = [];
+  var checkOutToday = [];
+  var checkInTomorrow = [];
+  var checkOutTomorrow = [];
+
+  for (var i = 0; i < stays.length; i++) {
+    var stay = stays[i];
+
+    // checkIn = the first booked night; the dog arrives that day.
+    // checkOut = the day AFTER the final booked night; the dog leaves that day.
+    // (This matches the existing semantics in getBoardingData().)
+    if (stay.checkIn === todayStr) {
+      checkInToday.push(stay);
+    }
+    if (stay.checkOut === todayStr) {
+      checkOutToday.push(stay);
+    }
+    if (stay.checkIn === tomorrowStr) {
+      checkInTomorrow.push(stay);
+    }
+    if (stay.checkOut === tomorrowStr) {
+      checkOutTomorrow.push(stay);
+    }
+  }
+
+  // Sort each bucket alphabetically by dog name for stable display
+  function byName(a, b) { return (a.dogName || '').localeCompare(b.dogName || ''); }
+  checkInToday.sort(byName);
+  checkOutToday.sort(byName);
+  checkInTomorrow.sort(byName);
+  checkOutTomorrow.sort(byName);
+
+  return {
+    today: todayStr,
+    tomorrow: tomorrowStr,
+    checkInToday: checkInToday,
+    checkOutToday: checkOutToday,
+    checkInTomorrow: checkInTomorrow,
+    checkOutTomorrow: checkOutTomorrow,
+    counts: {
+      checkInToday: checkInToday.length,
+      checkOutToday: checkOutToday.length,
+      checkInTomorrow: checkInTomorrow.length,
+      checkOutTomorrow: checkOutTomorrow.length
+    },
+    dateRange: boardingData.dateRange || { start: '', end: '' },
+    lastUpdated: new Date().toISOString(),
+    error: boardingData.error || null
+  };
+}
+
+/**
+ * Hits Acuity (via getBoardingData), derives the four buckets, and writes
+ * the result to PropertiesService. This is the ONLY function in the
+ * check-in/out flow that touches Acuity, and it should only ever be
+ * invoked by the two scheduled triggers — twice per day total.
+ *
+ * Safe to call manually from the Apps Script editor for testing.
+ *
+ * @return {Object} The stored snapshot, for logging / inspection
+ */
+function refreshCheckInOutSnapshot() {
+  var startedAt = new Date().toISOString();
+  Logger.log('[checkinout] refresh started at ' + startedAt);
+
+  // Re-use the existing Acuity-backed function — single source of truth
+  // for stay shape, date window, and type handling.
+  var boardingData = getBoardingData();
+  var snapshot = buildCheckInOutBuckets_(boardingData);
+
+  // Persist the snapshot so doGet?mode=checkinout never touches Acuity.
+  var props = PropertiesService.getScriptProperties();
+  try {
+    props.setProperty(CHECKINOUT_SNAPSHOT_KEY, JSON.stringify(snapshot));
+    props.setProperty(CHECKINOUT_SNAPSHOT_AT_KEY, startedAt);
+    Logger.log('[checkinout] snapshot stored: ' +
+      'checkInToday=' + snapshot.counts.checkInToday +
+      ', checkOutToday=' + snapshot.counts.checkOutToday +
+      ', checkInTomorrow=' + snapshot.counts.checkInTomorrow +
+      ', checkOutTomorrow=' + snapshot.counts.checkOutTomorrow);
+  } catch (e) {
+    Logger.log('[checkinout] snapshot write failed: ' + e.message);
+  }
+
+  return snapshot;
+}
+
+/**
+ * Returns the latest check-in/out snapshot for the doGet endpoint.
+ *
+ * Strategy:
+ *   1. Read from PropertiesService — instant, zero Acuity calls.
+ *   2. If no snapshot exists yet (first deploy), do a one-off fetch
+ *      so the endpoint never returns empty data. Subsequent requests
+ *      will then hit the cached snapshot until the next trigger fires.
+ *
+ * @return {Object} The snapshot
+ */
+function getCheckInOutData() {
+  var props = PropertiesService.getScriptProperties();
+
+  try {
+    var raw = props.getProperty(CHECKINOUT_SNAPSHOT_KEY);
+    if (raw) {
+      var parsed = JSON.parse(raw);
+      // Attach the stored timestamp for the client so it can show "last refresh"
+      var refreshedAt = props.getProperty(CHECKINOUT_SNAPSHOT_AT_KEY);
+      if (refreshedAt) parsed.snapshotRefreshedAt = refreshedAt;
+      return parsed;
+    }
+  } catch (e) {
+    Logger.log('[checkinout] snapshot read/parse failed, will refresh: ' + e.message);
+  }
+
+  // Self-heal — no snapshot yet. One-off Acuity call, then cache.
+  Logger.log('[checkinout] no snapshot found, doing one-off refresh');
+  return refreshCheckInOutSnapshot();
+}
+
+/**
+ * One-time setup — run this manually from the Apps Script editor to install
+ * the two daily refresh triggers. Idempotent: removes any existing triggers
+ * pointing at refreshCheckInOutSnapshot before adding the two new ones.
+ *
+ * After running this once, the Apps Script project will call Acuity exactly
+ * twice per day (at 07:00 and 19:00 Europe/London — the configured project
+ * timezone) and store the result in PropertiesService.
+ */
+function installRefreshTriggers() {
+  removeRefreshTriggers();
+
+  ScriptApp.newTrigger(CHECKINOUT_TRIGGER_HANDLER)
+    .timeBased()
+    .atHour(CHECKINOUT_MORNING_HOUR)
+    .everyDays(1)
+    .create();
+
+  ScriptApp.newTrigger(CHECKINOUT_TRIGGER_HANDLER)
+    .timeBased()
+    .atHour(CHECKINOUT_EVENING_HOUR)
+    .everyDays(1)
+    .create();
+
+  // Prime the cache straight away so the first TV poll has data to show
+  refreshCheckInOutSnapshot();
+
+  Logger.log('[checkinout] installed two daily triggers at ' +
+             CHECKINOUT_MORNING_HOUR + ':00 and ' +
+             CHECKINOUT_EVENING_HOUR + ':00 Europe/London');
+}
+
+/**
+ * Removes any existing refreshCheckInOutSnapshot triggers.
+ * Idempotent — safe to call repeatedly. Useful before reinstalling.
+ */
+function removeRefreshTriggers() {
+  var triggers = ScriptApp.getProjectTriggers();
+  var removed = 0;
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === CHECKINOUT_TRIGGER_HANDLER) {
+      ScriptApp.deleteTrigger(triggers[i]);
+      removed++;
+    }
+  }
+  Logger.log('[checkinout] removed ' + removed + ' existing trigger(s)');
+}
+
+/**
+ * Test helper — run from the Apps Script editor to inspect the snapshot
+ * without touching the triggers. Forces a fresh Acuity fetch.
+ */
+function testCheckInOutRefresh() {
+  var snapshot = refreshCheckInOutSnapshot();
+  Logger.log('Today: ' + snapshot.today + ' | Tomorrow: ' + snapshot.tomorrow);
+  Logger.log('--- Check-in Today (' + snapshot.counts.checkInToday + ') ---');
+  for (var i = 0; i < snapshot.checkInToday.length; i++) {
+    Logger.log('  ' + snapshot.checkInToday[i].dogName + ' [' + snapshot.checkInToday[i].type + ']');
+  }
+  Logger.log('--- Check-out Today (' + snapshot.counts.checkOutToday + ') ---');
+  for (var i = 0; i < snapshot.checkOutToday.length; i++) {
+    Logger.log('  ' + snapshot.checkOutToday[i].dogName + ' [' + snapshot.checkOutToday[i].type + ']');
+  }
+  Logger.log('--- Check-in Tomorrow (' + snapshot.counts.checkInTomorrow + ') ---');
+  for (var i = 0; i < snapshot.checkInTomorrow.length; i++) {
+    Logger.log('  ' + snapshot.checkInTomorrow[i].dogName + ' [' + snapshot.checkInTomorrow[i].type + ']');
+  }
+  Logger.log('--- Check-out Tomorrow (' + snapshot.counts.checkOutTomorrow + ') ---');
+  for (var i = 0; i < snapshot.checkOutTomorrow.length; i++) {
+    Logger.log('  ' + snapshot.checkOutTomorrow[i].dogName + ' [' + snapshot.checkOutTomorrow[i].type + ']');
   }
 }
