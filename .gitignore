@@ -3,3 +3,9 @@ node_modules/
 .clasprc.json
 .secrets/
 .env*
+
+# Internal notes. This repo is PUBLIC and these carry infrastructure detail
+# (VPS access, credential locations). They live in OneDrive, which syncs them
+# between machines without publishing them. Do not commit.
+CLAUDE.md
+ci-deploy-handover.md
