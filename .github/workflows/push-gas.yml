@@ -6,39 +6,114 @@ on:
     paths:
       - 'src/**'
       - '.clasp.json'
+      - '.claspignore'
+      - '.github/workflows/push-gas.yml'
+  workflow_dispatch:
+    inputs:
+      force_deploy:
+        description: 'Deploy even if the live project already matches the repo'
+        type: boolean
+        default: false
 
-# Allow the workflow to push the synced root index.html back to main.
-permissions:
-  contents: write
+# One deploy at a time. cancel-in-progress:false so an in-flight deploy is never
+# torn down between `clasp push` and `clasp redeploy` (that window is exactly
+# where a half-deployed project comes from). Note GitHub still collapses multiple
+# *pending* runs down to the newest one — that is fine and desirable, since the
+# newest commit is a superset of the ones it supersedes.
+concurrency:
+  group: gas-deploy
+  cancel-in-progress: false
+
+env:
+  SCRIPT_ID: 12ZBH5zualFVdVz23pmC7orrqcf6wyUA8YbXKa6kR3kxm4T4KdBubh5gM
+  DEPLOYMENT_ID: AKfycbz2kc3lJbrGk7lw9jVcZMdUrPWjRx4qBARM8YVAIARhYAlQwCzlhHBbKswyOcVHytmB7Q
+  EXEC_URL: https://script.google.com/macros/s/AKfycbz2kc3lJbrGk7lw9jVcZMdUrPWjRx4qBARM8YVAIARhYAlQwCzlhHBbKswyOcVHytmB7Q/exec
+  # Deliberately in the clear: this same token is hardcoded client-side in the
+  # public GitHub Pages frontend (index.html:548), so it is already public. It is
+  # an abuse rate-limiter, NOT an access control — the /exec endpoint is
+  # ANONYMOUS/ANYONE. Do not treat it as a secret, and do not rely on it to
+  # protect customer data.
+  API_TOKEN: ft-k9-board-2024-sec
+  # Pinned: the CLASPRC_JSON secret holds clasp v3 credentials
+  # ({"tokens":{"default":{...}}}) which clasp 2.x cannot read.
+  CLASP_VERSION: '3.3.0'
 
 jobs:
   sync-index:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
     steps:
+      # Fail loudly rather than skip: a skipped job reports the run GREEN, so an
+      # operator who dispatched the wrong branch would see a success tick and
+      # assume production shipped.
+      - name: Refuse non-main runs
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::Refusing to run from $GITHUB_REF - this workflow is main-only."
+            exit 1
+          fi
+
+      # Full history so the push retry below can rebase.
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Copy src/index.html to root for GitHub Pages
-        run: cp src/index.html index.html
-
-      - name: Commit updated root index.html (if changed)
+      - name: Sync src/index.html to root for GitHub Pages
         run: |
+          set -euo pipefail
+          test -f src/index.html || { echo "::error::src/index.html is missing."; exit 1; }
+          cp src/index.html index.html
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add index.html
           if git diff --cached --quiet; then
-            echo "No changes to commit"
-          else
-            git commit -m "Sync root index.html from src/ [auto]"
-            git push
+            echo "Root index.html already in sync - nothing to commit."
+            exit 0
           fi
+          git commit -m "Sync root index.html from src/ [auto]"
+          # Retry with rebase: a concurrent push to main would otherwise reject
+          # this and redden an otherwise healthy deploy.
+          for ATTEMPT in 1 2 3; do
+            if git push; then
+              echo "Pushed root index.html (attempt $ATTEMPT)."
+              exit 0
+            fi
+            echo "Push rejected on attempt $ATTEMPT - rebasing onto origin/main."
+            git fetch origin main
+            if ! git rebase origin/main; then
+              git rebase --abort || true
+              echo "::error::Could not rebase onto origin/main - resolve manually."
+              exit 1
+            fi
+            sleep 3
+          done
+          echo "::error::Could not push root index.html after 3 attempts."
+          exit 1
 
   deploy:
+    # Backend and frontend ship together: if the Pages sync fails we do NOT want
+    # a backend-only deploy going out against a stale frontend.
     needs: sync-index
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
     steps:
+      - name: Refuse non-main deploys
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::Refusing to deploy from $GITHUB_REF - production deploys are main-only."
+            exit 1
+          fi
+
+      # Full history — the drift guard fingerprints past committed states.
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -46,10 +121,277 @@ jobs:
           node-version: '20'
 
       - name: Install clasp
-        run: npm install @google/clasp -g
+        run: npm install -g "@google/clasp@${CLASP_VERSION}"
 
-      - name: Write clasp credentials
-        run: echo '${{ secrets.CLASPRC_JSON }}' > ~/.clasprc.json
+      # printf via an env var — NOT `echo '${{ secret }}'` — so quotes/newlines
+      # inside the JSON can never be mangled by shell interpolation. That
+      # mangling (plus an absent secret) is what broke every previous run.
+      - name: Write clasp credentials and verify auth
+        env:
+          CLASPRC: ${{ secrets.CLASPRC_JSON }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CLASPRC:-}" ]; then
+            echo "::error::Secret CLASPRC_JSON is empty or unset. Run 'clasp login' locally, then: gh secret set CLASPRC_JSON < ~/.clasprc.json"
+            exit 1
+          fi
+          printf '%s' "$CLASPRC" > ~/.clasprc.json
+          # Shape check, not just JSON validity: clasp v3 needs tokens.default.
+          node -e '
+            const fs = require("fs");
+            let j;
+            try { j = JSON.parse(fs.readFileSync(process.env.HOME + "/.clasprc.json", "utf8")); }
+            catch (e) { console.error("::error::CLASPRC_JSON is not valid JSON: " + e.message); process.exit(1); }
+            if (!j.tokens || !j.tokens.default || !j.tokens.default.refresh_token) {
+              console.error("::error::CLASPRC_JSON is not clasp v3 format (expected tokens.default.refresh_token). Re-run `clasp login` with clasp " + process.env.CLASP_VERSION + " and re-upload the secret.");
+              process.exit(1);
+            }
+            console.log("clasprc.json is valid clasp v3 credentials.");
+          '
+          # Auth preflight: turns an expired/revoked refresh token into a clear
+          # message here, instead of an opaque failure inside the drift guard.
+          if ! clasp show-authorized-user; then
+            echo "::error::clasp could not authenticate. The refresh token in CLASPRC_JSON is likely expired or revoked. Re-run 'clasp login' locally and update the secret."
+            exit 1
+          fi
 
-      - name: Push to Apps Script
+      # ------------------------------------------------------------------
+      # DRIFT GUARD + CONTENT GATE
+      #
+      # Fingerprint = sha256 over the SORTED set of per-file content hashes of
+      # every file in the project. Deliberately:
+      #   * name-agnostic  — the live script file has been Code.js and
+      #                      supersetplanner-feed.gs at different times, and a
+      #                      rename is not a content change.
+      #   * whitespace-normalised — Apps Script strips the trailing newline from
+      #                      appsscript.json, so a byte comparison NEVER matches
+      #                      and would redeploy production on every single run.
+      #   * whole-project  — any editor-added file of ANY type (.html, nested,
+      #                      extra .gs) changes the fingerprint, so it cannot be
+      #                      silently destroyed by `clasp push --force`, which
+      #                      does a whole-project replace.
+      #
+      # Three states are compared: repo, live HEAD, and the version the pinned
+      # /exec deployment actually serves. Deploying is skipped ONLY when all
+      # three agree — checking HEAD alone would let a run that pushed but failed
+      # before redeploying wedge production on a stale version forever.
+      #
+      # If live HEAD matches NO committed state, the editor holds changes the
+      # repo has never seen: FAIL rather than destroy them.
+      # ------------------------------------------------------------------
+      - name: Drift guard — refuse to clobber editor-only changes
+        id: guard
+        env:
+          FORCE_DEPLOY: ${{ github.event.inputs.force_deploy }}
+        run: |
+          set -euo pipefail
+
+          cat > /tmp/fingerprint.js <<'NODE_EOF'
+          const fs = require('fs'), path = require('path'), crypto = require('crypto');
+          const norm = b => b.toString('utf8').replace(/\r/g, '').replace(/\s+$/, '');
+          const sha  = s => crypto.createHash('sha256').update(s).digest('hex');
+          function walk(dir, acc) {
+            for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+              if (e.name === '.clasp.json') continue;   // clasp metadata, not project content
+              const p = path.join(dir, e.name);
+              e.isDirectory() ? walk(p, acc) : acc.push(p);
+            }
+            return acc;
+          }
+          const files = process.argv[2] === '--files'
+            ? process.argv.slice(3)
+            : walk(process.argv[2], []);
+          const hashes = files.map(f => sha(norm(fs.readFileSync(f)))).sort();
+          console.log(sha(hashes.join('\n')));
+          NODE_EOF
+
+          # --- repo state: exactly what clasp would push, per .claspignore ---
+          mapfile -t REPO_FILES < <(clasp show-file-status --json \
+            | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{JSON.parse(s).filesToPush.forEach(f=>console.log(f.replace(/\\/g,"/")))})')
+          if [ "${#REPO_FILES[@]}" -eq 0 ]; then
+            echo "::error::clasp reports no files to push. Check .clasp.json rootDir and .claspignore."
+            exit 1
+          fi
+          echo "Repo files to push: ${REPO_FILES[*]}"
+          REPO_FP=$(node /tmp/fingerprint.js --files "${REPO_FILES[@]}")
+
+          # --- live HEAD state ---
+          LIVE_DIR=$(mktemp -d)
+          ( cd "$LIVE_DIR" && clasp clone-script "$SCRIPT_ID" >/dev/null )
+          LIVE_FP=$(node /tmp/fingerprint.js "$LIVE_DIR")
+
+          # --- the version the pinned /exec deployment actually serves ---
+          DEPLOYED_VERSION=$(clasp list-deployments --json \
+            | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
+                const a=JSON.parse(s), d=a.find(x=>x.deploymentId===process.env.DEPLOYMENT_ID);
+                if(!d){console.error("::error::Deployment "+process.env.DEPLOYMENT_ID+" not found on script "+process.env.SCRIPT_ID);process.exit(1);}
+                console.log(d.versionNumber == null ? "" : d.versionNumber);
+              })')
+
+          if [ -z "$DEPLOYED_VERSION" ]; then
+            echo "Pinned deployment tracks @HEAD (no version) - treating as out of date."
+            DEPLOYED_FP="unversioned"
+          else
+            DEP_DIR=$(mktemp -d)
+            ( cd "$DEP_DIR" && clasp clone-script "$SCRIPT_ID" "$DEPLOYED_VERSION" >/dev/null )
+            DEPLOYED_FP=$(node /tmp/fingerprint.js "$DEP_DIR")
+          fi
+
+          echo "repo      fingerprint : $REPO_FP"
+          echo "live HEAD fingerprint : $LIVE_FP"
+          echo "deployed  fingerprint : $DEPLOYED_FP (version ${DEPLOYED_VERSION:-HEAD})"
+          echo "prev_version=$DEPLOYED_VERSION" >> "$GITHUB_OUTPUT"
+
+          # --- editor-drift check: only meaningful when live HEAD != repo ---
+          if [ "$LIVE_FP" != "$REPO_FP" ]; then
+            MATCHED=""
+            # Walk all recent commits and rebuild each one's push set from the
+            # tree. Using ls-tree (not `git log -- <path>`) means commits where
+            # the file did not exist, or existed under another name, simply
+            # yield nothing instead of a fatal "bad object".
+            for COMMIT in $(git log --format=%H -n 100); do
+              mapfile -t TREE_FILES < <(git ls-tree -r --name-only "$COMMIT" -- src/ \
+                | grep -E '(^src/appsscript\.json$|\.gs$|\.js$)' || true)
+              [ "${#TREE_FILES[@]}" -eq 0 ] && continue
+              TMP=$(mktemp -d)
+              OK=1
+              for F in "${TREE_FILES[@]}"; do
+                mkdir -p "$TMP/$(dirname "$F")"
+                git cat-file -p "$COMMIT:$F" > "$TMP/$F" 2>/dev/null || { OK=0; break; }
+              done
+              if [ "$OK" -eq 1 ]; then
+                FP=$(node /tmp/fingerprint.js "$TMP")
+                if [ "$FP" = "$LIVE_FP" ]; then MATCHED="$COMMIT"; fi
+              fi
+              rm -rf "$TMP"
+              if [ -n "$MATCHED" ]; then break; fi
+            done
+
+            if [ -z "$MATCHED" ]; then
+              echo "::error::LIVE SCRIPT MATCHES NO COMMITTED STATE. The Apps Script editor holds changes the repo has never seen - deploying would destroy them. Reconcile first: 'clasp clone-script $SCRIPT_ID' into a scratch dir, diff against src/, commit the merge, then re-run."
+              exit 1
+            fi
+            echo "Live HEAD matches committed state $MATCHED - safe to overwrite."
+          fi
+
+          # --- content gate: skip only when repo, HEAD and deployment all agree ---
+          if [ "$LIVE_FP" = "$REPO_FP" ] && [ "$DEPLOYED_FP" = "$REPO_FP" ]; then
+            if [ "${FORCE_DEPLOY:-}" = "true" ]; then
+              echo "Everything already in sync, but force_deploy was requested - deploying anyway."
+              echo "deploy=go" >> "$GITHUB_OUTPUT"
+            else
+              echo "Repo, live HEAD and the pinned deployment all agree - nothing to deploy."
+              echo "deploy=skip" >> "$GITHUB_OUTPUT"
+            fi
+            exit 0
+          fi
+
+          echo "Deploy required (source and/or deployed version differ from the repo)."
+          echo "deploy=go" >> "$GITHUB_OUTPUT"
+
+      - name: Push source to Apps Script HEAD
+        if: steps.guard.outputs.deploy == 'go'
         run: clasp push --force
+
+      - name: Create version and redeploy the pinned /exec deployment
+        id: redeploy
+        if: steps.guard.outputs.deploy == 'go'
+        run: |
+          set -euo pipefail
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          TITLE=$(git log -1 --format=%s | tr -cd 'A-Za-z0-9 ._:+-' | cut -c1-80)
+          DESC="CI $SHORT_SHA: $TITLE"
+
+          # --json gives {"versionNumber":N} exactly. The prose output is
+          # "Created version N", which an Intl thousands separator turns into
+          # "Created version 1,000" — digit-scraping that yields 000.
+          VERSION=$(clasp create-version --json "$DESC" \
+            | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
+                const j=JSON.parse(s);
+                if(!Number.isInteger(j.versionNumber)){console.error("::error::Unexpected create-version output: "+s);process.exit(1);}
+                console.log(j.versionNumber);
+              })')
+          echo "Created version $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          clasp redeploy "$DEPLOYMENT_ID" -V "$VERSION" -d "$DESC"
+
+          # Read back what the deployment actually serves - never trust the write.
+          ACTUAL=$(clasp list-deployments --json \
+            | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
+                const a=JSON.parse(s), d=a.find(x=>x.deploymentId===process.env.DEPLOYMENT_ID);
+                console.log(d && d.versionNumber != null ? d.versionNumber : "");
+              })')
+          if [ "$ACTUAL" != "$VERSION" ]; then
+            echo "::error::Redeploy did not take effect - deployment serves version '${ACTUAL:-HEAD}', expected $VERSION."
+            exit 1
+          fi
+          echo "Deployment $DEPLOYMENT_ID now serves version $VERSION."
+
+      - name: Smoke test the live /exec endpoint
+        if: steps.guard.outputs.deploy == 'go'
+        run: |
+          set -euo pipefail
+          cat > /tmp/validate.js <<'NODE_EOF'
+          const fs = require('fs');
+          const body = fs.readFileSync(process.argv[2], 'utf8');
+          let j;
+          try { j = JSON.parse(body); }
+          catch (e) { console.error('Response is not JSON: ' + body.slice(0, 300)); process.exit(1); }
+          // The backend returns {"stays":[], ..., "error":"..."} on EVERY failure
+          // path, so a bare grep for "stays" passes even when Acuity is down.
+          // Both the shape AND the absence of an error must be asserted.
+          if (!Array.isArray(j.stays)) { console.error('No "stays" array: ' + body.slice(0, 300)); process.exit(1); }
+          if (j.error) { console.error('Backend reported an error: ' + j.error); process.exit(1); }
+          console.log('valid payload, stays=' + j.stays.length);
+          NODE_EOF
+
+          for MODE in boarding checkinout; do
+            PASSED=0
+            # Apps Script is cold right after a redeploy and the backend fans out
+            # to Acuity/JotForm, so a single attempt is genuinely flaky.
+            for ATTEMPT in 1 2 3 4 5; do
+              set +e
+              CODE=$(curl -sS -L --max-time 120 -o /tmp/body.json -w '%{http_code}' \
+                "$EXEC_URL?token=$API_TOKEN&mode=$MODE")
+              CURL_RC=$?
+              set -e
+              if [ "$CURL_RC" -ne 0 ]; then
+                echo "mode=$MODE attempt $ATTEMPT: curl failed (rc=$CURL_RC)"
+              elif [ "$CODE" != "200" ]; then
+                echo "mode=$MODE attempt $ATTEMPT: HTTP $CODE"
+              elif node /tmp/validate.js /tmp/body.json; then
+                echo "mode=$MODE OK (attempt $ATTEMPT)"
+                PASSED=1
+                break
+              fi
+              if [ "$ATTEMPT" -lt 5 ]; then sleep 15; fi
+            done
+            if [ "$PASSED" -ne 1 ]; then
+              echo "::error::Smoke test failed for mode=$MODE after 5 attempts. Last body: $(head -c 300 /tmp/body.json 2>/dev/null)"
+              exit 1
+            fi
+          done
+
+      # If we repointed the live deployment and anything after that failed, put
+      # production back on the version it was serving before this run. Without
+      # this, a failed smoke test just reddens the build while users keep getting
+      # the broken version.
+      - name: Roll back the deployment on failure
+        if: failure() && steps.redeploy.outcome == 'success' && steps.guard.outputs.prev_version != ''
+        env:
+          PREV_VERSION: ${{ steps.guard.outputs.prev_version }}
+        run: |
+          set -euo pipefail
+          echo "::warning::Deploy failed after redeploy - rolling $DEPLOYMENT_ID back to version $PREV_VERSION."
+          clasp redeploy "$DEPLOYMENT_ID" -V "$PREV_VERSION" -d "CI rollback to v$PREV_VERSION"
+          ACTUAL=$(clasp list-deployments --json \
+            | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
+                const a=JSON.parse(s), d=a.find(x=>x.deploymentId===process.env.DEPLOYMENT_ID);
+                console.log(d && d.versionNumber != null ? d.versionNumber : "");
+              })')
+          if [ "$ACTUAL" != "$PREV_VERSION" ]; then
+            echo "::error::ROLLBACK FAILED - deployment serves '${ACTUAL:-HEAD}', expected $PREV_VERSION. Fix manually via the Apps Script editor."
+            exit 1
+          fi
+          echo "Rolled back to version $PREV_VERSION."
