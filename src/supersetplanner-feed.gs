@@ -41,20 +41,29 @@ var BOARDING_SCHOOL_TYPE_NAME = 'boarding school';
 
 // --- Cache durations ---
 var FEEDING_CACHE_SECONDS = 1800; // 30 minutes for JotForm data
-var BOARDING_TYPE_CACHE_SECONDS = 86400; // 24 hours for appointment type ID
-var BOARDING_DATA_CACHE_SECONDS = 900; // 15 minutes for the full boarding response
+var BOARDING_TYPE_CACHE_SECONDS = 21600; // 6 hours (CacheService max) for appointment type ID
+var FULL_RESPONSE_CACHE_SECONDS = 18000; // 5 hours — TV polls 3×/day at 07/13/18, 5h cache absorbs any extra reloads
+var STALE_CACHE_FALLBACK_SECONDS = 21600; // 6 hours — serve stale data when upstream fails
+
+// --- Dog name cache lives in PropertiesService (not CacheService) so it
+//     persists indefinitely. A given Acuity appointment ID's dog name never
+//     changes, so caching forever is safe and eliminates repeat detail fetches
+//     that were burning through Acuity's monthly bandwidth quota.
+var DOG_NAME_PROPERTY_KEY = 'acuityDogNameCache';
 
 // --- Date range for boarding data ---
-// Display window is today + FORWARD_DAYS. LOOKBACK_DAYS only needs to be long
-// enough to catch ongoing stays that started before today; 10 days covers the
-// vast majority of stays and keeps the appointments-list response small.
-var LOOKBACK_DAYS = 10;
+var LOOKBACK_DAYS = 7;   // Only need stays overlapping today/tomorrow
 var FORWARD_DAYS = 6;
 
 // --- API fetch limits ---
 var MAX_APPOINTMENTS = 500;
 var JOTFORM_PAGE_LIMIT = 1000;
 var CACHE_SIZE_LIMIT = 100000; // CacheService per-key limit in characters
+
+// CacheService key for the full boarding response — shared by
+// getBoardingData() and the check-in/out layer's read-only cache peek
+// (peekBoardingCache_) so the two can never drift apart.
+var FULL_RESPONSE_CACHE_KEY = 'fullBoardingResponse';
 
 // --- JotForm field IDs for form 240635310347348 ---
 // Update these if the JotForm is recreated with different field IDs
@@ -82,9 +91,11 @@ var JOTFORM_FIELDS = {
 
 /**
  * Serves data as JSON when the web app URL is visited.
- * Supports two modes via the 'mode' query parameter:
+ * Supports three modes via the 'mode' query parameter:
  *   - 'boarding' (default): Boarding calendar data from Acuity
  *   - 'feeding': Boarding stays + matched JotForm feeding records
+ *   - 'checkinout': Persisted stays snapshot + serve-time check-in/out
+ *     buckets (see the CHECK-IN / CHECK-OUT SNAPSHOT section below)
  *
  * @param {Object} e - The event parameter from doGet
  */
@@ -106,10 +117,14 @@ function doGet(e) {
     data = getFeedingBoardData();
   } else if (mode === 'checkinout') {
     // --- ADDED: Check-in / Check-out snapshot mode ---
-    // Returns the pre-computed four-bucket snapshot from PropertiesService.
-    // Acuity is only ever hit by the two scheduled triggers (07:00 and 19:00
-    // Europe/London) installed via installRefreshTriggers(), or as a one-off
-    // self-healing fallback when no snapshot exists yet.
+    // Serves the persisted stays snapshot, bucketed for the CURRENT date at
+    // request time, and always includes the full stays array (the documented
+    // contract the external Feeding Report Manager reads). Freshness comes
+    // free from the 5-hour boarding response cache when any boarding-mode
+    // client has warmed it (opportunistic adoption, zero Acuity); otherwise
+    // Acuity is only hit by the scheduled refresh triggers installed via
+    // installRefreshTriggers(), or by the backoff-limited self-healing
+    // inline refresh when the snapshot is missing or more than 14 h old.
     data = getCheckInOutData();
   } else {
     data = getBoardingData();
@@ -185,14 +200,24 @@ function acuityGet_(endpoint, params) {
   return withRetry_(function() {
     var response = UrlFetchApp.fetch(url, options);
     var code = response.getResponseCode();
+    var body = response.getContentText();
 
     if (code !== 200) {
-      Logger.log('Acuity API error (' + code + '): ' + response.getContentText());
-      throw new Error('Acuity API returned status ' + code);
+      Logger.log('Acuity API error (' + code + '): ' + body);
+      // Surface Acuity's error message (e.g. "Bandwidth quota exceeded...")
+      // so callers can distinguish bandwidth issues from other failures.
+      var detail = '';
+      try {
+        var parsed = JSON.parse(body);
+        detail = parsed.message || parsed.error || '';
+      } catch (_) {
+        detail = body.substring(0, 200);
+      }
+      throw new Error('Acuity API status ' + code + (detail ? ': ' + detail : ''));
     }
 
     try {
-      return JSON.parse(response.getContentText());
+      return JSON.parse(body);
     } catch (parseErr) {
       Logger.log('Acuity response parse error: ' + parseErr.message);
       throw new Error('Acuity API returned invalid JSON (status ' + code + ')');
@@ -247,44 +272,6 @@ function getAppointmentTypeId_(typeName, cacheKey) {
 /** Finds the appointmentTypeID for "Dog Boarding". */
 function getBoardingTypeId_() {
   return getAppointmentTypeId_(BOARDING_TYPE_NAME, 'boardingTypeId');
-}
-
-/**
- * Reads the persisted dog-name cache from PropertiesService.
- * Stored as a single JSON-encoded { appointmentId: dogName } map.
- *
- * Why PropertiesService instead of CacheService: appointment IDs are stable
- * and dog names for an ID never change, so we want the cache to survive
- * indefinitely. CacheService entries can be evicted at any time and are
- * capped at a 6-hour TTL, which forces unnecessary re-fetches of
- * /appointments/:id (the most expensive Acuity calls in this script).
- *
- * @return {Object} Map of { appointmentId: dogName }
- */
-function getDogNameCache_() {
-  try {
-    var stored = PropertiesService.getScriptProperties().getProperty('dogNameCache');
-    if (!stored) return {};
-    return JSON.parse(stored);
-  } catch (e) {
-    Logger.log('Dog name cache read error: ' + e.message);
-    return {};
-  }
-}
-
-/**
- * Persists the dog-name cache back to PropertiesService.
- * @param {Object} cacheObj - Map of { appointmentId: dogName }
- */
-function saveDogNameCache_(cacheObj) {
-  try {
-    PropertiesService.getScriptProperties().setProperty(
-      'dogNameCache',
-      JSON.stringify(cacheObj)
-    );
-  } catch (e) {
-    Logger.log('Dog name cache write error: ' + e.message);
-  }
 }
 
 /** Finds the appointmentTypeID for "Boarding School". */
@@ -352,12 +339,18 @@ function fetchAppointmentsForType_(typeId, minDate, maxDate, stayType) {
 
   if (!appointments || !appointments.length) return [];
 
-  // Check the dog name cache — persisted in PropertiesService so it survives
-  // across executions. Appointment IDs are stable and dog names for an ID
-  // don't change, so most refreshes will hit the cache for every appointment
-  // and skip the expensive per-appointment detail fetches entirely.
-  var dogNameCache = getDogNameCache_();
-  var dogNameCacheChanged = false;
+  // Dog names never change for a given appointment ID, so we persist them in
+  // PropertiesService (permanent) rather than CacheService (6 hour max). This
+  // ensures we only fetch an appointment's detail ONCE — ever — which is the
+  // critical fix for Acuity's "Bandwidth quota exceeded" error.
+  var props = PropertiesService.getScriptProperties();
+  var dogNameCache = {};
+  try {
+    var stored = props.getProperty(DOG_NAME_PROPERTY_KEY);
+    if (stored) dogNameCache = JSON.parse(stored);
+  } catch (e) {
+    Logger.log('Dog name property cache parse error: ' + e.message);
+  }
 
   // Only fetch details for appointments we haven't cached
   var authHeader = getAcuityAuthHeader_();
@@ -376,19 +369,29 @@ function fetchAppointmentsForType_(typeId, minDate, maxDate, stayType) {
     }
   }
 
-  // Fetch only uncached appointment details
+  // Fetch only uncached appointment details — in small batches with delays to avoid Acuity bandwidth limits
   if (fetchRequests.length > 0) {
-    var detailResponses = UrlFetchApp.fetchAll(fetchRequests);
+    var BATCH_SIZE = 5;
+    var allDetailResponses = [];
 
-    for (var r = 0; r < detailResponses.length; r++) {
-      if (detailResponses[r].getResponseCode() === 200) {
+    for (var batchStart = 0; batchStart < fetchRequests.length; batchStart += BATCH_SIZE) {
+      if (batchStart > 0) {
+        Utilities.sleep(2000); // 2s pause between batches to stay under Acuity rate/bandwidth limits
+      }
+      var batchEnd = Math.min(batchStart + BATCH_SIZE, fetchRequests.length);
+      var batch = fetchRequests.slice(batchStart, batchEnd);
+      var batchResponses = UrlFetchApp.fetchAll(batch);
+      allDetailResponses = allDetailResponses.concat(batchResponses);
+    }
+
+    for (var r = 0; r < allDetailResponses.length; r++) {
+      if (allDetailResponses[r].getResponseCode() === 200) {
         try {
-          var detail = JSON.parse(detailResponses[r].getContentText());
+          var detail = JSON.parse(allDetailResponses[r].getContentText());
           var extracted = extractDogName_(detail);
           var apptId = String(appointments[fetchIndices[r]].id);
           if (extracted) {
             dogNameCache[apptId] = extracted;
-            dogNameCacheChanged = true;
           }
         } catch (parseErr) {
           Logger.log('Failed to parse appointment detail: ' + parseErr.message);
@@ -396,9 +399,11 @@ function fetchAppointmentsForType_(typeId, minDate, maxDate, stayType) {
       }
     }
 
-    // Persist the dog name cache only if we added new entries.
-    if (dogNameCacheChanged) {
-      saveDogNameCache_(dogNameCache);
+    // Persist the dog name cache permanently — these mappings never change.
+    try {
+      props.setProperty(DOG_NAME_PROPERTY_KEY, JSON.stringify(dogNameCache));
+    } catch (e) {
+      Logger.log('Dog name property write error: ' + e.message);
     }
   }
 
@@ -425,65 +430,32 @@ function fetchAppointmentsForType_(typeId, minDate, maxDate, stayType) {
 // ============================================================
 
 /**
- * Public entry point. Returns the boarding data, served from a 15-minute
- * script-level cache when available. The cache key includes today's date
- * so the cached payload auto-invalidates at midnight.
- *
- * Why this matters: every TV / browser / mobile whiteboard that hits
- * doGet used to trigger a fresh round-trip to Acuity (1 list call + 1
- * detail call per appointment). With this cache, only one client per
- * 15-minute window actually contacts Acuity — the rest are served from
- * cache for free, dramatically reducing quota usage.
- *
- * Errors are NOT cached so transient failures retry immediately.
- *
- * @return {Object} { stays: [...], dateRange, lastUpdated, error }
- */
-function getBoardingData() {
-  var cache = CacheService.getScriptCache();
-  var today = new Date();
-  today.setHours(0, 0, 0, 0);
-  var cacheKey = 'boardingData_' + formatDate_(today);
-
-  var cached = cache.get(cacheKey);
-  if (cached) {
-    try {
-      return JSON.parse(cached);
-    } catch (e) {
-      Logger.log('Boarding data cache parse error: ' + e.message);
-    }
-  }
-
-  var data = computeBoardingData_();
-
-  // Only cache successful responses — we want errors to retry on next call.
-  if (data && !data.error) {
-    try {
-      var cacheData = JSON.stringify(data);
-      if (cacheData.length < CACHE_SIZE_LIMIT) {
-        cache.put(cacheKey, cacheData, BOARDING_DATA_CACHE_SECONDS);
-      } else {
-        Logger.log('Boarding data too large for cache (' + cacheData.length + ' bytes), skipping cache');
-      }
-    } catch (e) {
-      Logger.log('Boarding data cache write error: ' + e.message);
-    }
-  }
-
-  return data;
-}
-
-/**
  * Fetches boarding appointments from Acuity for today + 6 days,
  * groups them into stays, and returns structured data.
  *
- * Internal — called by getBoardingData() which adds the cache layer.
- *
+ * @param {boolean} [forceFresh] - Skip the cache READ and always refetch
+ *        (the fresh result still re-warms the 5-hour cache and the stale
+ *        mirror for every other caller). Used by the scheduled check-in/out
+ *        snapshot refresh so triggers persist genuinely fresh data.
  * @return {Object} { stays: [...], dateRange: { start, end }, lastUpdated, error }
  */
-function computeBoardingData_() {
+function getBoardingData(forceFresh) {
+  // Check full boarding response cache first (skipped on forceFresh)
+  var boardingCache = CacheService.getScriptCache();
+  if (!forceFresh) {
+    var cachedBoarding = boardingCache.get(FULL_RESPONSE_CACHE_KEY);
+    if (cachedBoarding) {
+      try {
+        Logger.log('Returning cached boarding response');
+        return JSON.parse(cachedBoarding);
+      } catch (e) {
+        Logger.log('Boarding cache parse error: ' + e.message);
+      }
+    }
+  }
+
   try {
-    // 1. Date range: LOOKBACK_DAYS back to today + FORWARD_DAYS forward
+    // 1. Date range: 7 days back to today + 6 days forward
     var today = new Date();
     today.setHours(0, 0, 0, 0);
 
@@ -620,15 +592,51 @@ function computeBoardingData_() {
       return a.dogName.localeCompare(b.dogName);
     });
 
-    return {
+    var boardingResult = {
       stays: stays,
       dateRange: { start: displayStart, end: displayEnd },
       lastUpdated: new Date().toISOString(),
       error: null
     };
 
+    // Cache so repeat calls (e.g. from getFeedingBoardData) don't re-fetch
+    try {
+      var brJson = JSON.stringify(boardingResult);
+      if (brJson.length < CACHE_SIZE_LIMIT) {
+        boardingCache.put(FULL_RESPONSE_CACHE_KEY, brJson, FULL_RESPONSE_CACHE_SECONDS);
+      }
+    } catch (cacheErr) {
+      Logger.log('Boarding cache write error: ' + cacheErr.message);
+    }
+
+    // Mirror the successful response into PropertiesService so we can serve
+    // stale data if Acuity throttles us on a later refresh.
+    try {
+      PropertiesService.getScriptProperties()
+        .setProperty('lastGoodBoardingResponse', JSON.stringify(boardingResult));
+    } catch (staleErr) {
+      Logger.log('Stale boarding write error: ' + staleErr.message);
+    }
+
+    return boardingResult;
+
   } catch (e) {
     Logger.log('getBoardingData error: ' + e.message);
+
+    // If Acuity is throttling us, fall back to the last good response so the
+    // TV keeps showing yesterday's data rather than going blank.
+    try {
+      var stale = PropertiesService.getScriptProperties()
+        .getProperty('lastGoodBoardingResponse');
+      if (stale) {
+        var staleParsed = JSON.parse(stale);
+        staleParsed.error = 'Showing last known data — upstream error: ' + e.message;
+        return staleParsed;
+      }
+    } catch (fallbackErr) {
+      Logger.log('Stale boarding read error: ' + fallbackErr.message);
+    }
+
     return {
       stays: [],
       dateRange: { start: '', end: '' },
@@ -884,6 +892,35 @@ function parseFeedingRecord_(submission) {
 // ============================================================
 
 /**
+ * Returns true if two strings are identical or differ by a single edit
+ * (one insertion, deletion, or substitution). Used for the fuzzy-surname
+ * fallback to absorb owner typos like "Wighthman" vs "Wightman".
+ *
+ * Guard: strings shorter than 4 chars must match exactly — fuzzy matching
+ * short surnames (e.g. "Fox" vs "Cox") is too risky.
+ *
+ * @param {string} a
+ * @param {string} b
+ * @return {boolean}
+ */
+function oneEditApart_(a, b) {
+  if (a === b) return true;
+  if (a.length < 4 || b.length < 4) return false;
+  if (Math.abs(a.length - b.length) > 1) return false;
+
+  // Match common prefix
+  var i = 0;
+  while (i < a.length && i < b.length && a.charAt(i) === b.charAt(i)) i++;
+  // Match common suffix (not overlapping the prefix)
+  var j = 0;
+  while (j < a.length - i && j < b.length - i &&
+         a.charAt(a.length - 1 - j) === b.charAt(b.length - 1 - j)) j++;
+
+  // At most one differing character remains in each string
+  return (a.length - i - j) <= 1 && (b.length - i - j) <= 1;
+}
+
+/**
  * Matches boarding stays to JotForm feeding records.
  *
  * Acuity stores dog names as "DogFirstName OwnerSurname" (e.g. "Woody Richardson").
@@ -914,6 +951,9 @@ function matchFeedingRecords_(stays, feedingRecords) {
   var MATCH_EXACT_SURNAME = 1;     // ownerSurname field matches
   var MATCH_FULLNAME_IN_FIELD = 2; // "Frida Walsh" in dog name field
   var MATCH_FIRST_NAME_ONLY = 3;   // dog first name only, no surname confirmation
+  // Fallback tiers — only used when tiers 1-3 find nothing (see block below the main loop)
+  var MATCH_FUZZY_SURNAME = 4;     // dog first name matches + surname is a 1-letter typo
+  var MATCH_SURNAME_ONLY = 5;      // surname field matches (covers blank/wrong dog name in Acuity)
 
   for (var i = 0; i < stays.length; i++) {
     var stay = stays[i];
@@ -988,6 +1028,63 @@ function matchFeedingRecords_(stays, feedingRecords) {
       }
     }
 
+    // --- FALLBACK TIERS ---
+    // Only run when the strict tiers (1-3) found nothing. These never override
+    // a good match; they only rescue cards that would otherwise be empty.
+    // Both are guarded to avoid attaching the wrong dog's feeding/medication info.
+    if (!bestMatch && acuitySurname) {
+      var fbMatch = null;
+      var fbPriority = 999;
+      var fbDate = '';
+      var surnameOnlyCount = 0; // how many records share this surname (ambiguity guard)
+
+      for (var m = 0; m < feedingRecords.length; m++) {
+        var rec = feedingRecords[m];
+        var rDogRaw = rec.dogName.replace(/\s+/g, ' ').toLowerCase().trim();
+        var rSur = rec.ownerSurname.replace(/\s+/g, ' ').toLowerCase().trim();
+        var rParts = rDogRaw.split(' ');
+        var rFirst = rParts[0] || '';
+        var rExtra = rParts.slice(1).join(' ');
+        // Surname to compare for the fuzzy tier: the surname field if filled,
+        // otherwise any trailing words in the dog-name field (e.g. "Shadow Wightman")
+        var rSurnameForFuzzy = rSur || rExtra;
+
+        var fp = 999;
+
+        // Fallback A — dog first name matches AND surname is a near-miss (1 letter off).
+        // Catches owner typos like JotForm "Wighthman" vs Acuity "Wightman".
+        if (rFirst === acuityDogName && rSurnameForFuzzy &&
+            oneEditApart_(rSurnameForFuzzy, acuitySurname)) {
+          fp = MATCH_FUZZY_SURNAME;
+        }
+        // Fallback B — surname field exactly matches Acuity's owner surname,
+        // regardless of dog name. Catches a blank/incorrect dog name in Acuity
+        // (e.g. intake form left empty, so the board falls back to the owner's name).
+        else if (rSur && rSur === acuitySurname) {
+          fp = MATCH_SURNAME_ONLY;
+          surnameOnlyCount++;
+        }
+        else {
+          continue;
+        }
+
+        if (!fbMatch || fp < fbPriority || (fp === fbPriority && rec.submittedAt > fbDate)) {
+          fbMatch = rec;
+          fbPriority = fp;
+          fbDate = rec.submittedAt;
+        }
+      }
+
+      // Surname-only matches must be unambiguous — if an owner has more than one
+      // dog with a feeding form under the same surname, we can't tell which is which,
+      // so leave the card empty rather than risk showing the wrong dog's food/meds.
+      if (fbMatch && !(fbPriority === MATCH_SURNAME_ONLY && surnameOnlyCount > 1)) {
+        bestMatch = fbMatch;
+        bestMatchPriority = fbPriority;
+        bestMatchDate = fbDate;
+      }
+    }
+
     // Count how many first-name-only matches we found (for ambiguity warning)
     var firstNameMatchCount = 0;
     if (bestMatchPriority === MATCH_FIRST_NAME_ONLY) {
@@ -1010,7 +1107,9 @@ function matchFeedingRecords_(stays, feedingRecords) {
       type: stay.type || 'boarding',
       matched: bestMatch !== null,
       matchType: bestMatch ? (bestMatchPriority === MATCH_EXACT_SURNAME ? 'exact' :
-                              bestMatchPriority === MATCH_FULLNAME_IN_FIELD ? 'fullname' : 'name_only') : 'none',
+                              bestMatchPriority === MATCH_FULLNAME_IN_FIELD ? 'fullname' :
+                              bestMatchPriority === MATCH_FUZZY_SURNAME ? 'fuzzy' :
+                              bestMatchPriority === MATCH_SURNAME_ONLY ? 'surname' : 'name_only') : 'none',
       ambiguousMatch: (firstNameMatchCount > 1)
     };
 
@@ -1112,13 +1211,28 @@ function buildKibbleSummary_(record) {
  * }
  */
 function getFeedingBoardData() {
+  // --- Full response cache: avoid hitting Acuity/JotForm on every TV refresh ---
+  var cache = CacheService.getScriptCache();
+  var cachedResponse = cache.get('fullFeedingResponse');
+  if (cachedResponse) {
+    try {
+      Logger.log('Returning cached feeding board response');
+      return JSON.parse(cachedResponse);
+    } catch (e) {
+      Logger.log('Cached response parse error, fetching fresh: ' + e.message);
+    }
+  }
+
   var feedingError = null;
 
   try {
     // 1. Get boarding stays (reuses existing function)
     var boardingData = getBoardingData();
 
-    if (boardingData.error) {
+    // Only bail out when boarding truly has no data. If the stale-cache fallback
+    // kicked in, boardingData.error will be set BUT stays will still be populated
+    // — let that through so the TV keeps showing last known dogs.
+    if (boardingData.error && (!boardingData.stays || boardingData.stays.length === 0)) {
       return {
         dogs: [],
         dogCount: 0,
@@ -1130,6 +1244,7 @@ function getFeedingBoardData() {
     }
 
     var stays = boardingData.stays || [];
+    var upstreamWarning = boardingData.error || null;
 
     // 2. Fetch and parse JotForm feeding submissions
     var feedingRecords = [];
@@ -1160,17 +1275,52 @@ function getFeedingBoardData() {
       return a.dogName.localeCompare(b.dogName);
     });
 
-    return {
+    var result = {
       dogs: dogs,
       dogCount: dogs.length,
       dateRange: boardingData.dateRange,
       lastUpdated: new Date().toISOString(),
-      error: null,
+      error: upstreamWarning,
       feedingError: feedingError
     };
 
+    // Cache the full response so subsequent TV refreshes don't hit APIs
+    try {
+      var resultJson = JSON.stringify(result);
+      if (resultJson.length < CACHE_SIZE_LIMIT) {
+        cache.put('fullFeedingResponse', resultJson, FULL_RESPONSE_CACHE_SECONDS);
+        Logger.log('Cached full feeding response (' + resultJson.length + ' chars, TTL ' + FULL_RESPONSE_CACHE_SECONDS + 's)');
+      }
+      // Only mirror a CLEAN response (no upstream warning) to the stale-fallback
+      // store — otherwise we'd overwrite good data with already-stale data.
+      if (!upstreamWarning) {
+        PropertiesService.getScriptProperties()
+          .setProperty('lastGoodFeedingResponse', resultJson);
+      }
+    } catch (cacheErr) {
+      Logger.log('Could not cache full response: ' + cacheErr.message);
+    }
+
+    return result;
+
   } catch (e) {
     Logger.log('getFeedingBoardData error: ' + e.message);
+
+    // Fall back to last good response so the TV keeps showing feeding data
+    // when Acuity throttles us. Better to show yesterday's dogs than nothing.
+    try {
+      var stale = PropertiesService.getScriptProperties()
+        .getProperty('lastGoodFeedingResponse');
+      if (stale) {
+        var staleParsed = JSON.parse(stale);
+        staleParsed.error = 'Showing last known data — upstream error: ' + e.message;
+        staleParsed.feedingError = feedingError;
+        return staleParsed;
+      }
+    } catch (fallbackErr) {
+      Logger.log('Stale feeding read error: ' + fallbackErr.message);
+    }
+
     return {
       dogs: [],
       dogCount: 0,
@@ -1217,60 +1367,241 @@ function testFeedingBoard() {
 // ============================================================
 // ADDED: CHECK-IN / CHECK-OUT SNAPSHOT
 // ------------------------------------------------------------
-// The TV display board ("Check-in / Out" tab) calls
+// The TV display board ("Check-in / Out" tab) and the external
+// Feeding Report Manager both call
 //   ?mode=checkinout&token=...
-// which returns a pre-computed snapshot of four dog lists:
-//   - checkInToday      (stay.checkIn === today)
-//   - checkOutToday     (stay.checkOut === today)
-//   - checkInTomorrow   (stay.checkIn === tomorrow)
-//   - checkOutTomorrow  (stay.checkOut === tomorrow)
 //
-// Acuity is only hit by the two scheduled triggers
-// (07:00 and 19:00 Europe/London) installed via
-// installRefreshTriggers(). Every other request reads the
-// last snapshot from PropertiesService — zero Acuity calls.
-// A one-off self-healing fetch runs only if no snapshot
-// exists yet (e.g. first deploy before any trigger has run).
+// The response ALWAYS carries BOTH:
+//   - stays: the full boarding stays list, verbatim from
+//     getBoardingData() — the documented external contract
+//     ({ dogName, checkIn, checkOut, type }) that the Feeding
+//     Report Manager's breakfast/dinner rosters and the TV's
+//     going-home index read. Mid-stay dogs exist ONLY here
+//     (they are in none of the four buckets), so this key must
+//     never be dropped from the response.
+//   - the four boundary-day buckets derived from those stays
+//     for the CURRENT Europe/London date at request time:
+//       checkInToday      (stay.checkIn === today)
+//       checkOutToday     (stay.checkOut === today)
+//       checkInTomorrow   (stay.checkIn === tomorrow)
+//       checkOutTomorrow  (stay.checkOut === tomorrow)
+//
+// Only the RAW STAYS are persisted (PropertiesService); the
+// buckets are recomputed on every request, so a snapshot
+// fetched at 19:00 still yields the correct buckets the next
+// morning — the stored data can age, the date arithmetic
+// cannot.
+//
+// Acuity budget (the quota is scarce — it exhausts quickly under
+// bursts, so every mechanism below is designed to spend at most
+// a fixed, predictable number of calls):
+//   - Three scheduled triggers (07:xx, 13:xx, 19:xx Europe/London)
+//     installed via installRefreshTriggers() — each SKIPS its
+//     fetch when the snapshot is already <65 min old, so the
+//     scheduled spend is ≤3 calls/day and often less.
+//   - OPPORTUNISTIC ADOPTION (zero Acuity): every serve peeks the
+//     5-hour boarding response cache (read-only, never fetching); when
+//     any boarding-mode client has warmed it with data newer than
+//     the snapshot, the snapshot silently adopts it. While the TV
+//     is on, freshness rides other tabs' traffic for free.
+//   - A self-healing inline refresh runs when the snapshot is
+//     missing OR older than 14 h (triggers missing/broken). It
+//     reads THROUGH the 5-hour boarding response cache and is
+//     rate-limited by a 10-minute failure backoff, so even the TV
+//     client's 15-second no-data retry loop cannot hammer Acuity
+//     during an outage (≤6 attempts/hour).
+//   - Duplicate triggers (e.g. installed by two different Google
+//     accounts — invisible to each other's getProjectTriggers())
+//     collapse into no-ops via the 65-min dedupe + a script lock.
+// A failed Acuity fetch is NEVER persisted: the last good
+// snapshot keeps being served (without an error field, so the
+// TV keeps rendering) until a later refresh succeeds.
 // ============================================================
 
-// PropertiesService keys for the snapshot
+// PropertiesService keys: the persisted stays snapshot, the last failed
+// refresh attempt (failure backoff), and the trigger-install stamp.
 var CHECKINOUT_SNAPSHOT_KEY = 'checkinoutSnapshot';
-var CHECKINOUT_SNAPSHOT_AT_KEY = 'checkinoutSnapshotAt';
+var CHECKINOUT_FAIL_AT_KEY = 'checkinoutLastFailAt';
+var CHECKINOUT_INSTALL_STAMP_KEY = 'checkinoutTriggersInstalledAt';
 
 // Refresh trigger handler name — referenced by installRefreshTriggers()
 var CHECKINOUT_TRIGGER_HANDLER = 'refreshCheckInOutSnapshot';
 
 // Refresh hours (Europe/London — the project's configured timezone).
-// Two daily triggers: one morning, one evening.
+// Three daily triggers: morning, midday (intraday freshness floor so a
+// same-day booking/cancellation surfaces by early afternoon at the latest),
+// evening. NOTE: Apps Script fires an atHour() trigger at an arbitrary
+// minute WITHIN that hour.
 var CHECKINOUT_MORNING_HOUR = 7;
+var CHECKINOUT_MIDDAY_HOUR = 13;
 var CHECKINOUT_EVENING_HOUR = 19;
 
+// Serve-time staleness threshold. The longest healthy gap between triggers
+// is overnight 19:xx → 07:xx (~13 h worst case with in-hour jitter), so an
+// age above this means the triggers are missing or broken → self-heal.
+var CHECKINOUT_STALE_MS = 14 * 60 * 60 * 1000;
+
+// A trigger-invoked refresh SKIPS its Acuity fetch when the snapshot is
+// younger than this. Wider than the worst in-hour jitter spread (59 min),
+// so two accounts' duplicate triggers in the same hour cost one fetch, and
+// a trigger firing just after an opportunistic adoption spends nothing.
+// Manual editor runs are exempt (they always fetch).
+var CHECKINOUT_TRIGGER_DEDUPE_MS = 65 * 60 * 1000;
+
+// After a FAILED fetch, non-trigger refresh attempts (the serve-path
+// self-heal) skip Acuity entirely for this long. Caps outage-time spend at
+// ~6 attempts/hour even under the TV's 15-second no-data retry loop.
+var CHECKINOUT_FAIL_BACKOFF_MS = 10 * 60 * 1000;
+
+// Script Properties allows ~9 KB per value; refuse to persist anything
+// bigger so the write cannot throw. (JSON here is ASCII-safe: char count ≈
+// bytes.) An unpersistably large stays list degrades gracefully — see
+// persistCheckInOutSnapshot_().
+var CHECKINOUT_PROPS_VALUE_LIMIT = 8900;
+
 /**
- * Returns 'YYYY-MM-DD' for a given Date in the project's timezone.
- * The project is configured as Europe/London (appsscript.json), so this
- * stays aligned with the TV browser's local time at the kennel.
+ * Reads and validates the persisted snapshot record. Returns
+ * { stays, dateRange, fetchedAt } or null. Legacy/corrupt values (e.g. a
+ * pre-rework bucket snapshot with no stays array) are ignored — callers
+ * treat null as "missing" and rebuild, so old shapes self-migrate.
  */
-function formatDateLondon_(date) {
-  return Utilities.formatDate(date, 'Europe/London', 'yyyy-MM-dd');
+function readStoredCheckInOutSnapshot_() {
+  try {
+    var raw = PropertiesService.getScriptProperties().getProperty(CHECKINOUT_SNAPSHOT_KEY);
+    if (!raw) return null;
+    var parsed = JSON.parse(raw);
+    if (parsed && Array.isArray(parsed.stays)) return parsed;
+  } catch (e) {
+    Logger.log('[checkinout] snapshot read/parse failed: ' + e.message);
+  }
+  return null;
 }
 
 /**
- * Builds the four check-in/check-out lists from a getBoardingData() result.
- * Pure function — given the same stays and reference date, always returns
- * the same buckets. No Acuity calls.
+ * Age of a stored snapshot record in ms, or NaN when unknowable.
+ * Comparisons against NaN are false, so callers must test the healthy
+ * range POSITIVELY (0 <= age <= limit) — never the inverse.
+ */
+function snapshotAgeMs_(stored) {
+  if (!stored || !stored.fetchedAt) return NaN;
+  return Date.now() - new Date(stored.fetchedAt).getTime();
+}
+
+/**
+ * READ-ONLY peek at getBoardingData's cached response (the 5-hour-TTL
+ * FULL_RESPONSE_CACHE_KEY entry). Never fetches, never writes — returns the
+ * cached success payload or null. This is the zero-Acuity freshness source:
+ * whenever any boarding-mode client (the TV's BOARDING PLAN iframe, the
+ * standalone planner page, or a ?mode=feeding call) fetched within the
+ * cache TTL, the check-in/out layer can adopt that data without spending a
+ * call of its own.
+ */
+function peekBoardingCache_() {
+  try {
+    var raw = CacheService.getScriptCache().get(FULL_RESPONSE_CACHE_KEY);
+    if (!raw) return null;
+    var parsed = JSON.parse(raw);
+    // Only successful payloads are ever cached, but guard anyway.
+    if (parsed && !parsed.error && Array.isArray(parsed.stays)) return parsed;
+  } catch (e) {
+    Logger.log('[checkinout] boarding cache peek failed: ' + e.message);
+  }
+  return null;
+}
+
+/**
+ * True when a peeked boarding payload is strictly fresher than the stored
+ * snapshot record (or the record is missing/unstamped/garbled). A peek
+ * without a lastUpdated stamp is never considered newer.
+ */
+function peekIsNewer_(peeked, stored) {
+  if (!peeked) return false;
+  if (!stored || !stored.fetchedAt) return true;
+  var storedTime = new Date(stored.fetchedAt).getTime();
+  if (isNaN(storedTime)) return true;
+  var peekTime = new Date(peeked.lastUpdated || 0).getTime();
+  return peekTime > storedTime;
+}
+
+/**
+ * Builds the persistable record from a SUCCESSFUL boarding payload.
+ */
+function makeSnapshotRecord_(boardingData) {
+  return {
+    stays: (boardingData && boardingData.stays) || [],
+    dateRange: (boardingData && boardingData.dateRange) || { start: '', end: '' },
+    fetchedAt: (boardingData && boardingData.lastUpdated) || new Date().toISOString()
+  };
+}
+
+/**
+ * Persists a snapshot record to Script Properties. Refuses oversized
+ * payloads (~9 KB per-value limit) instead of letting setProperty throw:
+ * the previous snapshot then keeps serving and, once it crosses the 14 h
+ * staleness threshold, every serve self-heals THROUGH the 5-hour response
+ * cache — i.e. the endpoint degrades to cached request-time behaviour (at
+ * most ~5 fetches/day) rather than freezing on old data.
+ *
+ * @return {boolean} true if persisted
+ */
+function persistCheckInOutRecord_(record) {
+  var json = JSON.stringify(record);
+  if (json.length > CHECKINOUT_PROPS_VALUE_LIMIT) {
+    Logger.log('[checkinout] snapshot NOT persisted — ' + json.length +
+               ' chars exceeds the ~9 KB Script Properties limit (' +
+               record.stays.length + ' stays). Serving degrades to cached' +
+               ' request-time fetching until the stays list shrinks.');
+    return false;
+  }
+  try {
+    PropertiesService.getScriptProperties().setProperty(CHECKINOUT_SNAPSHOT_KEY, json);
+    Logger.log('[checkinout] snapshot stored: ' + record.stays.length +
+               ' stays, fetched at ' + record.fetchedAt);
+    return true;
+  } catch (e) {
+    Logger.log('[checkinout] snapshot write FAILED — previous snapshot still serving: ' + e.message);
+    return false;
+  }
+}
+
+/**
+ * Serve-shape payload from a stored snapshot record: buckets computed for
+ * the CURRENT date + the stays passthrough. No fetching, no writes.
+ */
+function servePayloadFromStored_(stored) {
+  var data = buildCheckInOutBuckets_({
+    stays: stored.stays,
+    dateRange: stored.dateRange,
+    lastUpdated: stored.fetchedAt || null,
+    error: null
+  });
+  data.snapshotRefreshedAt = stored.fetchedAt || null;
+  return data;
+}
+
+/**
+ * Builds the check-in/out payload from a getBoardingData() result: the full
+ * stays list passed through verbatim, plus the four boundary-day buckets for
+ * the given reference date. No Acuity calls. Deterministic for a fixed
+ * boardingData + referenceDate (lastUpdated is taken from boardingData).
  *
  * @param {Object} boardingData - The result of getBoardingData()
  * @param {Date}   [referenceDate] - Optional override for "today"; defaults to now
- * @return {Object} { checkInToday, checkOutToday, checkInTomorrow, checkOutTomorrow,
- *                    dateRange, lastUpdated, error }
+ * @return {Object} { stays, today, tomorrow, checkInToday, checkOutToday,
+ *                    checkInTomorrow, checkOutTomorrow, counts, dateRange,
+ *                    lastUpdated, error }
  */
 function buildCheckInOutBuckets_(boardingData, referenceDate) {
+  // Reference dates use formatDate_ — the SAME formatter that produced
+  // stay.checkIn / stay.checkOut in getBoardingData — so the equality
+  // comparisons below can never diverge from the stays, whatever timezone
+  // the script project is configured with (Europe/London per appsscript.json).
   var now = referenceDate || new Date();
-  var todayStr = formatDateLondon_(now);
+  var todayStr = formatDate_(now);
 
   var tomorrow = new Date(now.getTime());
   tomorrow.setDate(tomorrow.getDate() + 1);
-  var tomorrowStr = formatDateLondon_(tomorrow);
+  var tomorrowStr = formatDate_(tomorrow);
 
   var stays = (boardingData && boardingData.stays) ? boardingData.stays : [];
 
@@ -1307,103 +1638,242 @@ function buildCheckInOutBuckets_(boardingData, referenceDate) {
   checkOutTomorrow.sort(byName);
 
   return {
+    // Full stays list, verbatim — the external Feeding Report Manager and the
+    // TV's going-home index read this key; the buckets alone cannot replace
+    // it (mid-stay dogs appear in no bucket).
+    stays: stays,
     today: todayStr,
     tomorrow: tomorrowStr,
     checkInToday: checkInToday,
     checkOutToday: checkOutToday,
     checkInTomorrow: checkInTomorrow,
     checkOutTomorrow: checkOutTomorrow,
+    // Derived values only — always computed here from the final bucket
+    // arrays (nothing mutates the buckets after this return, and counts are
+    // never persisted or maintained as separate state). Kept for log and
+    // client convenience.
     counts: {
       checkInToday: checkInToday.length,
       checkOutToday: checkOutToday.length,
       checkInTomorrow: checkInTomorrow.length,
       checkOutTomorrow: checkOutTomorrow.length
     },
-    dateRange: boardingData.dateRange || { start: '', end: '' },
-    lastUpdated: new Date().toISOString(),
-    error: boardingData.error || null
+    dateRange: (boardingData && boardingData.dateRange) || { start: '', end: '' },
+    lastUpdated: (boardingData && boardingData.lastUpdated) || new Date().toISOString(),
+    error: (boardingData && boardingData.error) || null
   };
 }
 
 /**
- * Hits Acuity (via getBoardingData), derives the four buckets, and writes
- * the result to PropertiesService. This is the ONLY function in the
- * check-in/out flow that touches Acuity, and it should only ever be
- * invoked by the two scheduled triggers — twice per day total.
+ * Scheduled trigger handler (and manual editor entry point).
  *
- * Safe to call manually from the Apps Script editor for testing.
+ * Trigger invocations (detected via the time-driven event object's
+ * triggerUid) SKIP the fetch when the snapshot is already <65 min old —
+ * so duplicate triggers (e.g. installed by two Google accounts) and a
+ * trigger firing just after an opportunistic cache adoption spend nothing.
+ * Manual editor runs are exempt from the dedupe and always force a
+ * genuinely fresh Acuity fetch (bypassing the 5-hour boarding cache).
  *
- * @return {Object} The stored snapshot, for logging / inspection
+ * @param {Object} [e] - Time-driven trigger event (absent on manual runs)
+ * @return {Object} The serve-shape payload, for logging / inspection
  */
-function refreshCheckInOutSnapshot() {
-  var startedAt = new Date().toISOString();
-  Logger.log('[checkinout] refresh started at ' + startedAt);
-
-  // Re-use the existing Acuity-backed function — single source of truth
-  // for stay shape, date window, and type handling.
-  var boardingData = getBoardingData();
-  var snapshot = buildCheckInOutBuckets_(boardingData);
-
-  // Persist the snapshot so doGet?mode=checkinout never touches Acuity.
-  var props = PropertiesService.getScriptProperties();
-  try {
-    props.setProperty(CHECKINOUT_SNAPSHOT_KEY, JSON.stringify(snapshot));
-    props.setProperty(CHECKINOUT_SNAPSHOT_AT_KEY, startedAt);
-    Logger.log('[checkinout] snapshot stored: ' +
-      'checkInToday=' + snapshot.counts.checkInToday +
-      ', checkOutToday=' + snapshot.counts.checkOutToday +
-      ', checkInTomorrow=' + snapshot.counts.checkInTomorrow +
-      ', checkOutTomorrow=' + snapshot.counts.checkOutTomorrow);
-  } catch (e) {
-    Logger.log('[checkinout] snapshot write failed: ' + e.message);
-  }
-
-  return snapshot;
+function refreshCheckInOutSnapshot(e) {
+  return refreshCheckInOutSnapshot_(true, !!(e && e.triggerUid));
 }
 
 /**
- * Returns the latest check-in/out snapshot for the doGet endpoint.
+ * Fetches boarding data, persists the RAW STAYS to PropertiesService, and
+ * returns the full serve-shape payload (stays + buckets for right now).
  *
- * Strategy:
- *   1. Read from PropertiesService — instant, zero Acuity calls.
- *   2. If no snapshot exists yet (first deploy), do a one-off fetch
- *      so the endpoint never returns empty data. Subsequent requests
- *      will then hit the cached snapshot until the next trigger fires.
+ * The returned payload carries an `error` IF AND ONLY IF no fresh data was
+ * obtained (failed fetch, failure backoff, or another refresh holds the
+ * lock) — getCheckInOutData() falls back to the stored snapshot in that
+ * case. A failed fetch is NEVER persisted (mirroring getBoardingData's
+ * only-cache-successes rule one layer up) but IS stamped so the failure
+ * backoff can rate-limit serve-path retries.
  *
- * @return {Object} The snapshot
+ * @param {boolean} forceFresh - true (triggers / manual runs) bypasses the
+ *        5-hour boarding response cache; false (self-heal on the serve
+ *        path) reads through it so request-time healing stays cheap.
+ * @param {boolean} [triggerInvoked] - true only for time-driven trigger
+ *        invocations; enables the 65-min dedupe skip.
+ * @return {Object} The serve-shape payload, for logging / inspection
  */
-function getCheckInOutData() {
+function refreshCheckInOutSnapshot_(forceFresh, triggerInvoked) {
   var props = PropertiesService.getScriptProperties();
+  var startedAt = new Date().toISOString();
 
-  try {
-    var raw = props.getProperty(CHECKINOUT_SNAPSHOT_KEY);
-    if (raw) {
-      var parsed = JSON.parse(raw);
-      // Attach the stored timestamp for the client so it can show "last refresh"
-      var refreshedAt = props.getProperty(CHECKINOUT_SNAPSHOT_AT_KEY);
-      if (refreshedAt) parsed.snapshotRefreshedAt = refreshedAt;
-      return parsed;
+  // Duplicate-trigger dedupe (quota, not correctness): skip the fetch when
+  // the snapshot is already fresher than the dedupe window.
+  if (triggerInvoked) {
+    var already = readStoredCheckInOutSnapshot_();
+    var age = snapshotAgeMs_(already);
+    if (age >= 0 && age <= CHECKINOUT_TRIGGER_DEDUPE_MS) {
+      Logger.log('[checkinout] trigger refresh skipped — snapshot only ' +
+                 Math.round(age / 60000) + ' min old (dedupe window ' +
+                 Math.round(CHECKINOUT_TRIGGER_DEDUPE_MS / 60000) + ' min)');
+      return servePayloadFromStored_(already);
     }
-  } catch (e) {
-    Logger.log('[checkinout] snapshot read/parse failed, will refresh: ' + e.message);
   }
 
-  // Self-heal — no snapshot yet. One-off Acuity call, then cache.
-  Logger.log('[checkinout] no snapshot found, doing one-off refresh');
-  return refreshCheckInOutSnapshot();
+  // Failure backoff (serve-path self-heal only): after a failed fetch, skip
+  // Acuity entirely for a while so the TV's 15-second no-data retry loop
+  // cannot hammer the API during an outage. Trigger/manual runs are exempt.
+  if (!forceFresh) {
+    var failRaw = props.getProperty(CHECKINOUT_FAIL_AT_KEY);
+    if (failRaw) {
+      var failAge = Date.now() - new Date(failRaw).getTime();
+      if (failAge >= 0 && failAge < CHECKINOUT_FAIL_BACKOFF_MS) {
+        Logger.log('[checkinout] self-heal fetch skipped — last attempt failed ' +
+                   Math.round(failAge / 60000) + ' min ago (backoff ' +
+                   Math.round(CHECKINOUT_FAIL_BACKOFF_MS / 60000) + ' min)');
+        return buildCheckInOutBuckets_({
+          stays: [],
+          error: 'Refresh backed off after a recent failed fetch'
+        });
+      }
+    }
+  }
+
+  // Serialise refreshes. A rival trigger/self-heal already in flight will
+  // store fresh data anyway, so failing to acquire the lock means "skip",
+  // never "fetch twice".
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(15000)) {
+    Logger.log('[checkinout] refresh skipped — another refresh holds the lock');
+    return buildCheckInOutBuckets_({
+      stays: [],
+      error: 'Another refresh is already in progress'
+    });
+  }
+
+  try {
+    // Re-check the dedupe under the lock — the rival we just waited for may
+    // have refreshed the snapshot moments ago.
+    if (triggerInvoked) {
+      var rechecked = readStoredCheckInOutSnapshot_();
+      var age2 = snapshotAgeMs_(rechecked);
+      if (age2 >= 0 && age2 <= CHECKINOUT_TRIGGER_DEDUPE_MS) {
+        Logger.log('[checkinout] trigger refresh skipped after lock — a rival refresh just completed');
+        return servePayloadFromStored_(rechecked);
+      }
+    }
+
+    Logger.log('[checkinout] refresh started at ' + startedAt +
+               (forceFresh ? ' (forced fresh fetch)' : ' (via boarding response cache)'));
+
+    // Re-use the existing Acuity-backed function — single source of truth
+    // for stay shape, date window, and type handling.
+    var boardingData = getBoardingData(forceFresh);
+
+    if (!boardingData || boardingData.error) {
+      var reason = (boardingData && boardingData.error) || 'getBoardingData() returned nothing';
+      Logger.log('[checkinout] refresh FAILED — previous snapshot kept: ' + reason);
+      try {
+        props.setProperty(CHECKINOUT_FAIL_AT_KEY, new Date().toISOString());
+      } catch (ignored) {
+        // A failed stamp only weakens the backoff — never worth throwing for.
+      }
+      return buildCheckInOutBuckets_(boardingData || { stays: [], error: reason });
+    }
+
+    var record = makeSnapshotRecord_(boardingData);
+    persistCheckInOutRecord_(record);
+
+    var data = buildCheckInOutBuckets_(boardingData);
+    data.snapshotRefreshedAt = record.fetchedAt;
+    return data;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Returns the check-in/out payload for the doGet endpoint.
+ *
+ * Strategy:
+ *   1. Read the persisted stays from PropertiesService and bucket them for
+ *      the CURRENT date — instant, zero Acuity calls, and immune to the
+ *      snapshot ageing across midnight (buckets are never stale-dated).
+ *   2. Self-heal with an inline refresh when the snapshot is missing (first
+ *      request after deploy) or older than CHECKINOUT_STALE_MS (scheduled
+ *      triggers missing/broken). The inline refresh reads through
+ *      getBoardingData's 5-hour response cache, so it stays cheap even if
+ *      it runs on every request.
+ *   3. A failed refresh never masks good data: while any stored snapshot
+ *      exists it is served WITHOUT an error field (the TV client treats any
+ *      error as total failure); the error is only surfaced when there is
+ *      nothing at all to serve, so the client retries.
+ *
+ * @return {Object} { stays, today, tomorrow, checkInToday, checkOutToday,
+ *                    checkInTomorrow, checkOutTomorrow, counts, dateRange,
+ *                    lastUpdated, snapshotRefreshedAt, error }
+ */
+function getCheckInOutData() {
+  var stored = readStoredCheckInOutSnapshot_();
+
+  // OPPORTUNISTIC ADOPTION (zero Acuity): if any boarding-mode client warmed
+  // the boarding response cache with data NEWER than the snapshot, adopt it —
+  // both freshens a healthy snapshot and heals a stale/missing one for free.
+  var peeked = peekBoardingCache_();
+  if (peekIsNewer_(peeked, stored)) {
+    var adopted = makeSnapshotRecord_(peeked);
+    // A refused (oversized) persist is harmless — we still serve `adopted`
+    // from memory below, and the next serve simply re-adopts.
+    persistCheckInOutRecord_(adopted);
+    stored = adopted;
+    Logger.log('[checkinout] adopted fresher boarding-cache data (fetched ' +
+               adopted.fetchedAt + ') — zero Acuity spent');
+  }
+
+  // NaN-safe: a missing/garbled fetchedAt fails the range check → unhealthy.
+  var ageMs = snapshotAgeMs_(stored);
+  var healthy = (ageMs >= 0 && ageMs <= CHECKINOUT_STALE_MS);
+
+  if (!healthy) {
+    Logger.log('[checkinout] snapshot ' + (stored ? 'stale/unstamped' : 'missing') +
+               ' — inline self-heal refresh');
+    var fresh = refreshCheckInOutSnapshot_(false);
+    if (!fresh.error) return fresh;
+    if (!stored) return fresh; // nothing better exists — surface the error so the client retries
+    // Refresh failed but an older good snapshot exists: fall through and
+    // serve it without an error so the board keeps showing real dogs.
+  }
+
+  return servePayloadFromStored_(stored);
 }
 
 /**
  * One-time setup — run this manually from the Apps Script editor to install
- * the two daily refresh triggers. Idempotent: removes any existing triggers
- * pointing at refreshCheckInOutSnapshot before adding the two new ones.
+ * the three daily refresh triggers (07:xx, 13:xx and 19:xx Europe/London —
+ * Apps Script picks the exact minute within each hour; the midday trigger
+ * is the intraday freshness floor).
  *
- * After running this once, the Apps Script project will call Acuity exactly
- * twice per day (at 07:00 and 19:00 Europe/London — the configured project
- * timezone) and store the result in PropertiesService.
+ * Idempotent PER GOOGLE ACCOUNT: getProjectTriggers() only sees the running
+ * account's triggers, so always install/remove from the same account. If a
+ * different account's triggers already exist this logs a loud warning —
+ * accidental duplicates cost no extra Acuity calls (the 65-min dedupe in
+ * the handler collapses them), but clean-up must run from the account that
+ * owns them.
+ *
+ * Scheduled spend: at most 3 Acuity calls/day — each trigger skips its
+ * fetch when the snapshot is already <65 min old (e.g. just refreshed by
+ * an opportunistic boarding-cache adoption).
  */
 function installRefreshTriggers() {
-  removeRefreshTriggers();
+  var props = PropertiesService.getScriptProperties();
+  var existingStamp = props.getProperty(CHECKINOUT_INSTALL_STAMP_KEY);
+  var removed = removeRefreshTriggers();
+
+  if (existingStamp && removed === 0) {
+    Logger.log('[checkinout] ⚠ WARNING: an install stamp from ' + existingStamp +
+               ' exists but THIS account sees no triggers to replace — the live' +
+               ' triggers were probably installed by a DIFFERENT Google account' +
+               ' (or deleted by hand). Installing another set now is safe for' +
+               ' Acuity quota (the 65-min dedupe collapses duplicates), but the' +
+               ' redundant executions remain until removeRefreshTriggers() is' +
+               ' run from the original account.');
+  }
 
   ScriptApp.newTrigger(CHECKINOUT_TRIGGER_HANDLER)
     .timeBased()
@@ -1413,21 +1883,35 @@ function installRefreshTriggers() {
 
   ScriptApp.newTrigger(CHECKINOUT_TRIGGER_HANDLER)
     .timeBased()
+    .atHour(CHECKINOUT_MIDDAY_HOUR)
+    .everyDays(1)
+    .create();
+
+  ScriptApp.newTrigger(CHECKINOUT_TRIGGER_HANDLER)
+    .timeBased()
     .atHour(CHECKINOUT_EVENING_HOUR)
     .everyDays(1)
     .create();
 
-  // Prime the cache straight away so the first TV poll has data to show
+  props.setProperty(CHECKINOUT_INSTALL_STAMP_KEY, new Date().toISOString());
+
+  // Prime the snapshot straight away so the first TV poll has data to show
+  // (manual-style call: always fetches fresh, exempt from the dedupe).
   refreshCheckInOutSnapshot();
 
-  Logger.log('[checkinout] installed two daily triggers at ' +
-             CHECKINOUT_MORNING_HOUR + ':00 and ' +
-             CHECKINOUT_EVENING_HOUR + ':00 Europe/London');
+  Logger.log('[checkinout] installed three daily triggers in the ' +
+             CHECKINOUT_MORNING_HOUR + ':00, ' + CHECKINOUT_MIDDAY_HOUR +
+             ':00 and ' + CHECKINOUT_EVENING_HOUR +
+             ':00 hours Europe/London (exact minute chosen by Apps Script)');
 }
 
 /**
- * Removes any existing refreshCheckInOutSnapshot triggers.
- * Idempotent — safe to call repeatedly. Useful before reinstalling.
+ * Removes THIS ACCOUNT'S refreshCheckInOutSnapshot triggers. Triggers
+ * installed by a different Google account are invisible here and survive —
+ * run this signed in as the installing account. Clears the install stamp
+ * only when triggers were actually removed.
+ *
+ * @return {number} How many triggers were removed
  */
 function removeRefreshTriggers() {
   var triggers = ScriptApp.getProjectTriggers();
@@ -1438,12 +1922,31 @@ function removeRefreshTriggers() {
       removed++;
     }
   }
+  var props = PropertiesService.getScriptProperties();
+  var stamp = props.getProperty(CHECKINOUT_INSTALL_STAMP_KEY);
+  if (removed > 0) {
+    try {
+      props.deleteProperty(CHECKINOUT_INSTALL_STAMP_KEY);
+    } catch (ignored) {
+      // Stamp is advisory only.
+    }
+  } else if (stamp) {
+    Logger.log('[checkinout] removed 0 triggers but an install stamp from ' +
+               stamp + ' exists — the live triggers likely belong to a' +
+               ' different Google account; run removeRefreshTriggers() from' +
+               ' that account.');
+  }
   Logger.log('[checkinout] removed ' + removed + ' existing trigger(s)');
+  return removed;
 }
 
 /**
- * Test helper — run from the Apps Script editor to inspect the snapshot
- * without touching the triggers. Forces a fresh Acuity fetch.
+ * Test helper — run from the Apps Script editor to force a fresh Acuity
+ * fetch, REBUILD AND PERSIST the snapshot (side effect: overwrites the
+ * stored stays on success; a failed fetch leaves it untouched), and log the
+ * four buckets. Does not touch the triggers. To LOOK at the current state
+ * without spending an Acuity call or writing anything, use
+ * inspectCheckInOutSnapshot() instead.
  */
 function testCheckInOutRefresh() {
   var snapshot = refreshCheckInOutSnapshot();
@@ -1463,5 +1966,79 @@ function testCheckInOutRefresh() {
   Logger.log('--- Check-out Tomorrow (' + snapshot.counts.checkOutTomorrow + ') ---');
   for (var i = 0; i < snapshot.checkOutTomorrow.length; i++) {
     Logger.log('  ' + snapshot.checkOutTomorrow[i].dogName + ' [' + snapshot.checkOutTomorrow[i].type + ']');
+  }
+}
+
+/**
+ * Counts this account's refreshCheckInOutSnapshot triggers (triggers owned
+ * by other Google accounts are invisible). -1 when the API is unavailable.
+ */
+function countCheckInOutTriggers_() {
+  try {
+    var triggers = ScriptApp.getProjectTriggers();
+    var n = 0;
+    for (var i = 0; i < triggers.length; i++) {
+      if (triggers[i].getHandlerFunction() === CHECKINOUT_TRIGGER_HANDLER) n++;
+    }
+    return n;
+  } catch (e) {
+    return -1;
+  }
+}
+
+/**
+ * READ-ONLY inspector — run from the Apps Script editor to see exactly what
+ * ?mode=checkinout would serve RIGHT NOW. Zero Acuity calls, zero writes:
+ * logs the stored snapshot record (age, stay count), the boarding-cache
+ * peek state, the failure/install stamps, which source a request would use,
+ * and the buckets it would produce. Use testCheckInOutRefresh() when you
+ * WANT to fetch fresh data and overwrite the snapshot.
+ */
+function inspectCheckInOutSnapshot() {
+  var props = PropertiesService.getScriptProperties();
+
+  var stored = readStoredCheckInOutSnapshot_();
+  if (stored) {
+    var age = snapshotAgeMs_(stored);
+    Logger.log('[inspect] stored snapshot: ' + stored.stays.length +
+               ' stays, fetched at ' + stored.fetchedAt + ' (' +
+               (isNaN(age) ? 'unknown age' : Math.round(age / 60000) + ' min ago') + ')');
+  } else {
+    Logger.log('[inspect] no usable stored snapshot (missing, legacy-shaped, or corrupt)');
+    var rawStored = props.getProperty(CHECKINOUT_SNAPSHOT_KEY);
+    if (rawStored) {
+      Logger.log('[inspect] raw property value (first 300 chars): ' + rawStored.substring(0, 300));
+    }
+  }
+
+  var peeked = peekBoardingCache_();
+  Logger.log('[inspect] boarding response cache: ' + (peeked
+    ? (peeked.stays.length + ' stays, computed at ' + peeked.lastUpdated)
+    : 'cold (no entry)'));
+
+  Logger.log('[inspect] last failed refresh: ' +
+             (props.getProperty(CHECKINOUT_FAIL_AT_KEY) || 'none'));
+  Logger.log('[inspect] trigger install stamp: ' +
+             (props.getProperty(CHECKINOUT_INSTALL_STAMP_KEY) || 'none') +
+             ' | triggers visible to THIS account: ' + countCheckInOutTriggers_());
+
+  var source = null;
+  if (peekIsNewer_(peeked, stored)) {
+    source = makeSnapshotRecord_(peeked);
+    Logger.log('[inspect] a request now would ADOPT the fresher boarding cache (zero Acuity)');
+  } else if (stored) {
+    source = stored;
+    Logger.log('[inspect] a request now would serve the stored snapshot');
+  } else {
+    Logger.log('[inspect] a request now would attempt a self-heal refresh (through the boarding response cache)');
+  }
+
+  if (source) {
+    var payload = servePayloadFromStored_(source);
+    Logger.log('[inspect] buckets for today ' + payload.today + ' / tomorrow ' +
+               payload.tomorrow + ': inToday=' + payload.counts.checkInToday +
+               ' outToday=' + payload.counts.checkOutToday +
+               ' inTomorrow=' + payload.counts.checkInTomorrow +
+               ' outTomorrow=' + payload.counts.checkOutTomorrow);
   }
 }
