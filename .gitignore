@@ -9,3 +9,7 @@ node_modules/
 # between machines without publishing them. Do not commit.
 CLAUDE.md
 ci-deploy-handover.md
+
+.task/
+
+.gate-evidence/
