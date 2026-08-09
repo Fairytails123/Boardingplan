@@ -16,19 +16,40 @@
 //   stays may appear/disappear incorrectly around midnight.
 //
 // SETUP:
-//   Update the credential variables below if keys are rotated.
+//   API credentials live in SCRIPT PROPERTIES (Project Settings → Script
+//   Properties), never in this file — this source is committed to the PUBLIC
+//   Boardingplan repo. Required properties: ACUITY_USER_ID, ACUITY_API_KEY,
+//   JOTFORM_API_KEY. On rotation, update the Script Properties only.
 //   Update API_TOKEN and match it in index.html.
 // ============================================================
 
-// --- Acuity API Credentials ---
-var ACUITY_USER_ID = '13914499';
-var ACUITY_API_KEY = 'e9059c6c60e2e64e5561b25802a366e9';
+// --- Acuity API ---
 var ACUITY_BASE_URL = 'https://acuityscheduling.com/api/v1';
 
-// --- JotForm API Credentials ---
-var JOTFORM_API_KEY = '03e6dc875fac74cd82ebc8e3c047990c';
+// --- JotForm API ---
 var JOTFORM_FORM_ID = '240635310347348';
 var JOTFORM_BASE_URL = 'https://eu-api.jotform.com';
+
+// --- API credentials, lazy-loaded from Script Properties ---
+// The PropertiesService reads must stay INSIDE the getter: global scope
+// re-evaluates on every /exec request, and each global read would count
+// against the 50,000/day Script Properties quota.
+var CREDS_ = null;
+function getCreds_() {
+  if (!CREDS_) {
+    var props = PropertiesService.getScriptProperties();
+    var creds = {
+      acuityUserId: props.getProperty('ACUITY_USER_ID'),
+      acuityApiKey: props.getProperty('ACUITY_API_KEY'),
+      jotformApiKey: props.getProperty('JOTFORM_API_KEY')
+    };
+    if (!creds.acuityUserId || !creds.acuityApiKey || !creds.jotformApiKey) {
+      throw new Error('Missing Script Properties — set ACUITY_USER_ID, ACUITY_API_KEY and JOTFORM_API_KEY in Project Settings → Script Properties');
+    }
+    CREDS_ = creds;
+  }
+  return CREDS_;
+}
 
 // --- API Token for request validation ---
 var API_TOKEN = 'ft-k9-board-2024-sec';
@@ -81,7 +102,8 @@ var JOTFORM_FIELDS = {
   TIN_FOOD: '50',
   SPECIAL_NOTES: '40',
   MEDICATION: '38',
-  MEDICATION_DETAILS: '26'
+  MEDICATION_DETAILS: '26',
+  TRAINING_SUPPLEMENTS: '61'
 };
 
 
@@ -91,11 +113,17 @@ var JOTFORM_FIELDS = {
 
 /**
  * Serves data as JSON when the web app URL is visited.
- * Supports three modes via the 'mode' query parameter:
+ * Supports four modes via the 'mode' query parameter:
  *   - 'boarding' (default): Boarding calendar data from Acuity
  *   - 'feeding': Boarding stays + matched JotForm feeding records
  *   - 'checkinout': Persisted stays snapshot + serve-time check-in/out
  *     buckets (see the CHECK-IN / CHECK-OUT SNAPSHOT section below)
+ *   - 'clearfeedingcache': ADMIN — drops the fullFeedingResponse and
+ *     jotformFeedingData cache keys so the NEXT mode=feeding call rebuilds
+ *     from live JotForm data (fresh parse picks up edited submissions,
+ *     which the created_at-incremental fetch would otherwise miss until
+ *     cache expiry). Deliberately leaves the boarding caches alone —
+ *     clearing feeding costs zero Acuity quota. Token-gated like all modes.
  *
  * @param {Object} e - The event parameter from doGet
  */
@@ -115,6 +143,12 @@ function doGet(e) {
 
   if (mode === 'feeding') {
     data = getFeedingBoardData();
+  } else if (mode === 'clearfeedingcache') {
+    var adminCache = CacheService.getScriptCache();
+    adminCache.remove('fullFeedingResponse');
+    adminCache.remove('jotformFeedingData');
+    data = { cleared: ['fullFeedingResponse', 'jotformFeedingData'],
+             note: 'Next mode=feeding call rebuilds from live JotForm data.' };
   } else if (mode === 'checkinout') {
     // --- ADDED: Check-in / Check-out snapshot mode ---
     // Serves the persisted stays snapshot, bucketed for the CURRENT date at
@@ -144,7 +178,8 @@ function doGet(e) {
  * Builds the Basic Auth header for Acuity API requests.
  */
 function getAcuityAuthHeader_() {
-  return 'Basic ' + Utilities.base64Encode(ACUITY_USER_ID + ':' + ACUITY_API_KEY);
+  var creds = getCreds_();
+  return 'Basic ' + Utilities.base64Encode(creds.acuityUserId + ':' + creds.acuityApiKey);
 }
 
 /**
@@ -673,7 +708,7 @@ function fetchJotformPage_(offset, limit, createdAfter) {
   var filterStr = encodeURIComponent(JSON.stringify(filterObj));
 
   var url = JOTFORM_BASE_URL + '/form/' + JOTFORM_FORM_ID + '/submissions'
-    + '?apiKey=' + JOTFORM_API_KEY
+    + '?apiKey=' + getCreds_().jotformApiKey
     + '&limit=' + limit
     + '&offset=' + offset
     + '&orderby=created_at'
@@ -833,12 +868,41 @@ function fetchJotformSubmissions_() {
  *   49 = Wet Food Quantity - Pouch/Tray (dropdown)
  *   50 = Wet Tin Food Quantity (dropdown)
  *   40 = Special Food Requirements / Additional Notes (textarea)
- *   38 = Medication (dropdown: Yes / No)
+ *   38 = Medication (dropdown: Yes / No) — PRESCRIPTION meds only
  *   26 = Medication Details (textarea)
+ *   61 = Training Supplements (checkbox: Hemp Oil / Multivitamin Tabs /
+ *        Probiotic Powder/Tab / Calming Tabs) — deliberately separate from
+ *        medication so the board can render them as a non-alert subcard
  *
  * @param {Object} submission - Raw JotForm submission object
  * @return {Object|null} Parsed feeding record, or null if invalid
  */
+/**
+ * Normalises a JotForm CHECKBOX answer to an array of strings. Checkbox
+ * answers are usually arrays, occasionally a bare string, and via some
+ * table-edit/API paths (or an added "Other" option) an OBJECT keyed by
+ * index, e.g. {"0":"Hemp Oil","other":"..."}. An unrecognised shape is
+ * logged rather than dropped silently — these fields exist to make items
+ * visible, so a quiet [] is the worst possible failure mode.
+ */
+function parseCheckboxAnswer_(raw, fieldLabel) {
+  if (raw === null || raw === undefined) return [];
+  if (Array.isArray(raw)) return raw;
+  if (typeof raw === 'string') return raw.trim() ? [raw.trim()] : [];
+  if (typeof raw === 'object') {
+    var out = [];
+    for (var k in raw) {
+      if (raw.hasOwnProperty(k) && typeof raw[k] === 'string' && raw[k].trim()) {
+        out.push(raw[k].trim());
+      }
+    }
+    return out;
+  }
+  Logger.log('parseCheckboxAnswer_: dropped unrecognised ' + fieldLabel +
+             ' answer shape: ' + typeof raw);
+  return [];
+}
+
 function parseFeedingRecord_(submission) {
   // Skip deleted submissions — allow ACTIVE, CUSTOM, and other valid statuses
   // "CUSTOM" is JotForm's status for manually edited entries — perfectly valid
@@ -858,14 +922,11 @@ function parseFeedingRecord_(submission) {
   var dogName = getAnswer(JOTFORM_FIELDS.DOG_NAME);
   if (!dogName || (typeof dogName === 'string' && !dogName.trim())) return null;
 
-  // Food types come as an array (checkbox field) or a string
-  var foodTypesRaw = getAnswer(JOTFORM_FIELDS.FOOD_TYPES);
-  var foodTypes = [];
-  if (Array.isArray(foodTypesRaw)) {
-    foodTypes = foodTypesRaw;
-  } else if (typeof foodTypesRaw === 'string' && foodTypesRaw.trim()) {
-    foodTypes = [foodTypesRaw.trim()];
-  }
+  // Checkbox fields (foodTypes, trainingSupplements) share one normaliser —
+  // see parseCheckboxAnswer_. Supplements stay SEPARATE from medication:
+  // the red med chip on the board is prescription-only.
+  var foodTypes = parseCheckboxAnswer_(getAnswer(JOTFORM_FIELDS.FOOD_TYPES), 'foodTypes');
+  var supplements = parseCheckboxAnswer_(getAnswer(JOTFORM_FIELDS.TRAINING_SUPPLEMENTS), 'trainingSupplements');
 
   return {
     dogName: (typeof dogName === 'string') ? dogName.trim() : String(dogName).trim(),
@@ -882,6 +943,7 @@ function parseFeedingRecord_(submission) {
     specialNotes: (getAnswer(JOTFORM_FIELDS.SPECIAL_NOTES) || '').trim(),
     medication: (getAnswer(JOTFORM_FIELDS.MEDICATION) || '').trim(),
     medicationDetails: (getAnswer(JOTFORM_FIELDS.MEDICATION_DETAILS) || '').trim(),
+    supplements: supplements,
     submittedAt: submission.created_at || ''
   };
 }
@@ -1124,7 +1186,8 @@ function matchFeedingRecords_(stays, feedingRecords) {
         tinFood: bestMatch.tinFood,
         specialNotes: bestMatch.specialNotes,
         medication: bestMatch.medication,
-        medicationDetails: bestMatch.medicationDetails
+        medicationDetails: bestMatch.medicationDetails,
+        supplements: bestMatch.supplements || []
       };
     } else {
       dogObj.feeding = null;
