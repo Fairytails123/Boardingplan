@@ -14,23 +14,20 @@ Everything committed here is world-readable, including full git history.
 
 **Before committing anything, assume it will be read by strangers.**
 
-### Live exposure — NOT yet fixed
+### Credential exposure — FIXED 2026-08-09/10 (rotation + Script Properties extraction)
 
-`src/supersetplanner-feed.gs` hardcodes real API credentials at lines 24–31, and that file
-is committed to the public repo. These are readable right now:
+The API keys that used to be hardcoded in `src/supersetplanner-feed.gs` were rotated
+(old values revoked) and the script now reads `ACUITY_USER_ID` / `ACUITY_API_KEY` /
+`JOTFORM_API_KEY` from **Script Properties**, lazily inside `getCreds_()` — never at
+global scope (global-scope PropertiesService reads count against the 50k/day quota on
+every `/exec` request). The committed source carries no secrets; the revoked values in
+git history are harmless. **Never reintroduce a credential literal into this file** —
+on rotation only the Script Properties values change, no code change and no deploy.
 
-- `ACUITY_API_KEY` — Acuity Scheduling. Grants access to the booking system: customer
-  names, contact details, appointment history.
-- `JOTFORM_API_KEY` — JotForm (EU). Grants access to form submissions.
-
-Current values are vaulted in `.secrets/secrets.env` (gitignored) so a rotation cannot
-lose them. **Treat both as compromised until rotated.** Rotating alone is not enough —
-the old values remain in git history forever, so the code must stop hardcoding them.
-
-The fix is `PropertiesService.getScriptProperties()`: set the values as Script Properties
-in the Apps Script editor (Project Settings → Script Properties) and read them at runtime.
-Apps Script cannot read `.env` files, so Script Properties is the correct store. See
-`ci-deploy-handover.md` for the full plan.
+⚠️ Do NOT edit this project's Script Properties via the IDE settings page: its whole-set
+save silently fails against the large runtime property blobs (dogNameCache, lastGood*,
+checkinoutSnapshot). Rotate via a temporary self-seed block in `getCreds_()` pushed with
+clasp, trigger one request, then remove the block and push clean.
 
 ### What is NOT a secret
 
